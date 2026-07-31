@@ -110,7 +110,8 @@ struct ProviderUsage {
 #[derive(Serialize)]
 struct UsageWindow {
     label: &'static str,
-    used_percent: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    used_percent: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reset_at: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -300,23 +301,7 @@ fn fetch_codex(client: &Client, fetched_at: u64) -> ProviderUsage {
             );
         }
     };
-    let windows = [
-        codex_window(
-            data.pointer("/rate_limit/primary_window")
-                .or_else(|| data.get("primary_window")),
-            "5h",
-            &data,
-        ),
-        codex_window(
-            data.pointer("/rate_limit/secondary_window")
-                .or_else(|| data.get("secondary_window")),
-            "7d",
-            &data,
-        ),
-    ]
-    .into_iter()
-    .flatten()
-    .collect::<Vec<_>>();
+    let windows = codex_windows(&data);
     if windows.is_empty() {
         return unavailable(
             Provider::Codex,
@@ -338,13 +323,37 @@ fn fetch_codex(client: &Client, fetched_at: u64) -> ProviderUsage {
     }
 }
 
+fn codex_windows(data: &Value) -> Vec<UsageWindow> {
+    let mut windows = [
+        codex_window(
+            data.pointer("/rate_limit/primary_window")
+                .or_else(|| data.get("primary_window")),
+            "5h",
+            data,
+        ),
+        codex_window(
+            data.pointer("/rate_limit/secondary_window")
+                .or_else(|| data.get("secondary_window")),
+            "7d",
+            data,
+        ),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
+    if !windows.iter().any(|window| window.label == "5h") {
+        windows.insert(0, unavailable_window("5h"));
+    }
+    windows
+}
+
 fn codex_window(raw: Option<&Value>, fallback: &'static str, data: &Value) -> Option<UsageWindow> {
     let raw = raw?;
     let used_percent = raw.get("used_percent")?.as_f64()?.clamp(0.0, 100.0);
     let window_seconds = raw.get("limit_window_seconds").and_then(Value::as_u64);
     Some(UsageWindow {
         label: window_label(window_seconds, fallback),
-        used_percent,
+        used_percent: Some(used_percent),
         reset_at: raw.get("reset_at").and_then(Value::as_u64),
         window_seconds,
         limit_reached: data
@@ -356,6 +365,16 @@ fn codex_window(raw: Option<&Value>, fallback: &'static str, data: &Value) -> Op
             })
             .or_else(|| raw.get("limit_reached").and_then(Value::as_bool)),
     })
+}
+
+fn unavailable_window(label: &'static str) -> UsageWindow {
+    UsageWindow {
+        label,
+        used_percent: None,
+        reset_at: None,
+        window_seconds: None,
+        limit_reached: None,
+    }
 }
 
 fn window_label(seconds: Option<u64>, fallback: &'static str) -> &'static str {
@@ -581,7 +600,7 @@ fn opencode_window(
             .ok()?;
         Some(UsageWindow {
             label,
-            used_percent,
+            used_percent: Some(used_percent),
             reset_at: Some(fetched_at.saturating_add(reset_in_seconds)),
             window_seconds: Some(seconds),
             limit_reached: None,
@@ -610,12 +629,26 @@ fn render_dashboard(snapshot: &Snapshot, colors: bool) -> String {
             ));
             continue;
         }
-        if !rendered_header {
+        if !rendered_header
+            && provider
+                .windows
+                .iter()
+                .any(|window| window.used_percent.is_some())
+        {
             lines.push(header_text(colors));
             rendered_header = true;
         }
         for window in &provider.windows {
-            let percent = rounded_percent(window.used_percent);
+            let Some(used_percent) = window.used_percent else {
+                let bar = usage_bar(0, BAR_WIDTH);
+                let bar = if colors { muted_text(&bar) } else { bar };
+                lines.push(format!(
+                    "  {:<3} [{}] {:>3}  {:>RESET_WIDTH$}",
+                    window.label, bar, "", "unavailable"
+                ));
+                continue;
+            };
+            let percent = rounded_percent(used_percent);
             let bar = usage_bar(percent, BAR_WIDTH);
             let bar = if colors {
                 format!("{}{}\x1b[0m", usage_color(percent), bar)
@@ -636,11 +669,11 @@ fn render_dashboard(snapshot: &Snapshot, colors: bool) -> String {
 
 fn header_text(colors: bool) -> String {
     let header = format!("      {:<35}  {:>RESET_WIDTH$}", "usage", "resets in");
-    if colors {
-        format!("\x1b[38;2;156;163;175m{header}\x1b[0m")
-    } else {
-        header
-    }
+    if colors { muted_text(&header) } else { header }
+}
+
+fn muted_text(text: &str) -> String {
+    format!("\x1b[38;2;156;163;175m{text}\x1b[0m")
 }
 
 fn rounded_percent(percent: f64) -> u8 {
@@ -725,7 +758,27 @@ mod tests {
         assert_eq!(windows[0].label, "5h");
         assert_eq!(windows[0].reset_at, Some(8_200));
         assert_eq!(windows[1].label, "7d");
-        assert_eq!(windows[1].used_percent, 25.0);
+        assert_eq!(windows[1].used_percent, Some(25.0));
+    }
+
+    #[test]
+    fn missing_codex_primary_window_remains_visible() {
+        let data = serde_json::json!({
+            "rate_limit": {
+                "primary_window": {
+                    "used_percent": 21.0,
+                    "reset_at": 2_000,
+                    "limit_window_seconds": 604_800
+                }
+            }
+        });
+
+        let windows = codex_windows(&data);
+        assert_eq!(windows.len(), 2);
+        assert_eq!(windows[0].label, "5h");
+        assert_eq!(windows[0].used_percent, None);
+        assert_eq!(windows[1].label, "7d");
+        assert_eq!(windows[1].used_percent, Some(21.0));
     }
 
     #[test]
@@ -739,7 +792,7 @@ mod tests {
                 source: None,
                 windows: vec![UsageWindow {
                     label: "5h",
-                    used_percent: 50.0,
+                    used_percent: Some(50.0),
                     reset_at: Some(4_600),
                     window_seconds: Some(18_000),
                     limit_reached: None,
@@ -759,6 +812,31 @@ mod tests {
         assert!(lines[2].ends_with("1h 00m"));
         assert_eq!(dashboard.matches("resets in").count(), 1);
         assert!(!dashboard.contains("reset in"));
+    }
+
+    #[test]
+    fn dashboard_mutes_unavailable_windows() {
+        let snapshot = Snapshot {
+            fetched_at: 1_000,
+            providers: vec![ProviderUsage {
+                provider: "codex",
+                available: true,
+                plan: None,
+                source: None,
+                windows: vec![unavailable_window("5h")],
+                error: None,
+                fetched_at: 1_000,
+            }],
+        };
+
+        assert_eq!(
+            render_dashboard(&snapshot, false),
+            format!(
+                "Codex\n  5h  [{}]      unavailable",
+                usage_bar(0, BAR_WIDTH)
+            )
+        );
+        assert!(render_dashboard(&snapshot, true).contains("\x1b[38;2;156;163;175m"));
     }
 
     #[test]

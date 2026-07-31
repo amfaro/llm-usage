@@ -26,7 +26,7 @@ Lookup order:
 4. `~/.pi/auth.json`
 5. `~/.codex/auth.json`
 
-The discovered credential must be an OAuth credential. Log in again with Codex or Pi when it expires.
+The discovered credential must be an OAuth credential. Log in again with Codex or Pi when it expires. When the upstream response omits a window (currently the Codex 5h window), the dashboard retains a muted `unavailable` row; it returns automatically when supplied again.
 
 ### OpenCode Go
 
