@@ -18,6 +18,7 @@ use serde::Serialize;
 use serde_json::Value;
 
 const BAR_WIDTH: usize = 28;
+const RESET_WIDTH: usize = 9;
 const CODEX_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
 const OPENCODE_GO_URL: &str = "https://opencode.ai";
 
@@ -589,7 +590,8 @@ fn opencode_window(
 }
 
 fn render_dashboard(snapshot: &Snapshot, colors: bool) -> String {
-    let mut lines = vec!["Usage dashboard".to_owned()];
+    let mut lines = vec![];
+    let mut rendered_header = false;
     for provider in &snapshot.providers {
         let label = match provider.provider {
             "codex" => Provider::Codex.label(),
@@ -608,6 +610,10 @@ fn render_dashboard(snapshot: &Snapshot, colors: bool) -> String {
             ));
             continue;
         }
+        if !rendered_header {
+            lines.push(header_text(colors));
+            rendered_header = true;
+        }
         for window in &provider.windows {
             let percent = rounded_percent(window.used_percent);
             let bar = usage_bar(percent, BAR_WIDTH);
@@ -617,7 +623,7 @@ fn render_dashboard(snapshot: &Snapshot, colors: bool) -> String {
                 bar
             };
             lines.push(format!(
-                "  {:<3} [{}] {:>3}%{}",
+                "  {:<3} [{}] {:>3}%  {:>RESET_WIDTH$}",
                 window.label,
                 bar,
                 percent,
@@ -626,6 +632,15 @@ fn render_dashboard(snapshot: &Snapshot, colors: bool) -> String {
         }
     }
     lines.join("\n")
+}
+
+fn header_text(colors: bool) -> String {
+    let header = format!("      {:<35}  {:>RESET_WIDTH$}", "usage", "resets in");
+    if colors {
+        format!("\x1b[38;2;156;163;175m{header}\x1b[0m")
+    } else {
+        header
+    }
 }
 
 fn rounded_percent(percent: f64) -> u8 {
@@ -656,14 +671,14 @@ fn reset_text(reset_at: Option<u64>, now: u64) -> String {
     };
     let seconds = reset_at.saturating_sub(now);
     if seconds == 0 {
-        return " → resets now".to_owned();
+        return "now".to_owned();
     }
     let hours = seconds / 3600;
     let minutes = (seconds % 3600) / 60;
     if hours > 0 {
-        format!(" → reset in {hours}h {minutes}m")
+        format!("{hours}h {minutes:02}m")
     } else {
-        format!(" → reset in {minutes}m")
+        format!("{minutes}m")
     }
 }
 
@@ -711,6 +726,39 @@ mod tests {
         assert_eq!(windows[0].reset_at, Some(8_200));
         assert_eq!(windows[1].label, "7d");
         assert_eq!(windows[1].used_percent, 25.0);
+    }
+
+    #[test]
+    fn dashboard_labels_usage_and_right_aligns_resets() {
+        let snapshot = Snapshot {
+            fetched_at: 1_000,
+            providers: vec![ProviderUsage {
+                provider: "codex",
+                available: true,
+                plan: None,
+                source: None,
+                windows: vec![UsageWindow {
+                    label: "5h",
+                    used_percent: 50.0,
+                    reset_at: Some(4_600),
+                    window_seconds: Some(18_000),
+                    limit_reached: None,
+                }],
+                error: None,
+                fetched_at: 1_000,
+            }],
+        };
+
+        let dashboard = render_dashboard(&snapshot, false);
+        let lines: Vec<_> = dashboard.lines().collect();
+        assert_eq!(
+            lines[1],
+            "      usage                                resets in"
+        );
+        assert_eq!(lines[2].chars().count(), lines[1].chars().count());
+        assert!(lines[2].ends_with("1h 00m"));
+        assert_eq!(dashboard.matches("resets in").count(), 1);
+        assert!(!dashboard.contains("reset in"));
     }
 
     #[test]
