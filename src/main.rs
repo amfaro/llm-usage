@@ -4,10 +4,14 @@ use std::{
     io::{self, IsTerminal, Read, Write},
     path::{Path, PathBuf},
     thread,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use crossterm::{
+    event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
+    terminal::{disable_raw_mode, enable_raw_mode},
+};
 use regex::Regex;
 use reqwest::{Url, blocking::Client, redirect::Policy};
 use serde::Serialize;
@@ -130,21 +134,74 @@ fn main() {
 }
 
 fn watch(args: &WatchArgs) -> i32 {
-    let colors =
-        io::stdout().is_terminal() && !args.display.no_color && env::var_os("NO_COLOR").is_none();
+    let terminal = io::stdout().is_terminal();
+    let colors = terminal && !args.display.no_color && env::var_os("NO_COLOR").is_none();
     loop {
         let snapshot = fetch_snapshot(&args.display.query.providers);
-        if io::stdout().is_terminal() {
+        if terminal {
             print!("\x1b[2J\x1b[H");
         }
         println!(
-            "{}\n\nrefresh: {}s · Ctrl+C to exit",
+            "{}\n\nrefresh: {}s · q to exit",
             render_dashboard(&snapshot, colors),
             args.interval
         );
         let _ = io::stdout().flush();
-        thread::sleep(Duration::from_secs(args.interval));
+        let raw_mode = io::stdin()
+            .is_terminal()
+            .then(RawMode::enable)
+            .transpose()
+            .ok()
+            .flatten();
+        if wait_for_exit(Duration::from_secs(args.interval), raw_mode.is_some()) {
+            return 0;
+        }
     }
+}
+
+struct RawMode;
+
+impl RawMode {
+    fn enable() -> io::Result<Self> {
+        enable_raw_mode()?;
+        Ok(Self)
+    }
+}
+
+impl Drop for RawMode {
+    fn drop(&mut self) {
+        let _ = disable_raw_mode();
+    }
+}
+
+fn wait_for_exit(timeout: Duration, read_keys: bool) -> bool {
+    if !read_keys {
+        thread::sleep(timeout);
+        return false;
+    }
+
+    let deadline = Instant::now() + timeout;
+    loop {
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            return false;
+        };
+        if !event::poll(remaining).unwrap_or(false) {
+            return false;
+        }
+        if matches!(event::read(), Ok(Event::Key(key)) if is_exit_key(key)) {
+            return true;
+        }
+    }
+}
+
+fn is_exit_key(key: KeyEvent) -> bool {
+    key.kind == KeyEventKind::Press
+        && matches!(
+            (key.code, key.modifiers),
+            (KeyCode::Char('q'), KeyModifiers::NONE)
+                | (KeyCode::Char('c'), KeyModifiers::CONTROL)
+                | (KeyCode::Char('d'), KeyModifiers::CONTROL)
+        )
 }
 
 fn print_once(args: &DisplayArgs) -> i32 {
@@ -624,6 +681,16 @@ fn home_dir() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exit_keys_are_limited_to_q_and_control_shortcuts() {
+        let key = |code, modifiers| KeyEvent::new(code, modifiers);
+        assert!(is_exit_key(key(KeyCode::Char('q'), KeyModifiers::NONE)));
+        assert!(is_exit_key(key(KeyCode::Char('c'), KeyModifiers::CONTROL)));
+        assert!(is_exit_key(key(KeyCode::Char('d'), KeyModifiers::CONTROL)));
+        assert!(!is_exit_key(key(KeyCode::Char('Q'), KeyModifiers::SHIFT)));
+        assert!(!is_exit_key(key(KeyCode::Enter, KeyModifiers::NONE)));
+    }
 
     #[test]
     fn usage_bar_clamps_at_one_hundred_percent() {

@@ -10,7 +10,7 @@ cargo run -- once --provider codex
 cargo run -- watch --interval 60 --no-color
 ```
 
-`watch` is the default command. Use `--provider codex` or `--provider opencode-go` repeatedly to filter providers.
+`watch` is the default command. Press `q` to exit. Use `--provider codex` or `--provider opencode-go` repeatedly to filter providers.
 
 ## Credentials
 
