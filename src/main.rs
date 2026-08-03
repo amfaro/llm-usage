@@ -170,7 +170,10 @@ fn watch(args: &WatchArgs) -> i32 {
             .transpose()
             .ok()
             .flatten();
-        if wait_for_exit(Duration::from_secs(args.interval), raw_mode.is_some()) {
+        if matches!(
+            wait_for_action(Duration::from_secs(args.interval), raw_mode.is_some()),
+            WaitAction::Exit
+        ) {
             return 0;
         }
     }
@@ -191,22 +194,29 @@ impl Drop for RawMode {
     }
 }
 
-fn wait_for_exit(timeout: Duration, read_keys: bool) -> bool {
+enum WaitAction {
+    Exit,
+    Refresh,
+}
+
+fn wait_for_action(timeout: Duration, read_keys: bool) -> WaitAction {
     if !read_keys {
         thread::sleep(timeout);
-        return false;
+        return WaitAction::Refresh;
     }
 
     let deadline = Instant::now() + timeout;
     loop {
         let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
-            return false;
+            return WaitAction::Refresh;
         };
         if !event::poll(remaining).unwrap_or(false) {
-            return false;
+            return WaitAction::Refresh;
         }
-        if matches!(event::read(), Ok(Event::Key(key)) if is_exit_key(key)) {
-            return true;
+        match event::read() {
+            Ok(Event::Key(key)) if is_exit_key(key) => return WaitAction::Exit,
+            Ok(event) if is_resize_event(&event) => return WaitAction::Refresh,
+            _ => {}
         }
     }
 }
@@ -218,6 +228,10 @@ fn is_exit_key(key: KeyEvent) -> bool {
             (KeyCode::Char('q'), KeyModifiers::NONE)
                 | (KeyCode::Char('c' | 'd'), KeyModifiers::CONTROL)
         )
+}
+
+fn is_resize_event(event: &Event) -> bool {
+    matches!(event, Event::Resize(_, _))
 }
 
 fn print_once(args: &DisplayArgs) -> i32 {
@@ -840,6 +854,15 @@ mod tests {
         assert!(is_exit_key(key(KeyCode::Char('d'), KeyModifiers::CONTROL)));
         assert!(!is_exit_key(key(KeyCode::Char('Q'), KeyModifiers::SHIFT)));
         assert!(!is_exit_key(key(KeyCode::Enter, KeyModifiers::NONE)));
+    }
+
+    #[test]
+    fn resize_events_trigger_refresh() {
+        assert!(is_resize_event(&Event::Resize(80, 24)));
+        assert!(!is_resize_event(&Event::Key(KeyEvent::new(
+            KeyCode::Char('q'),
+            KeyModifiers::NONE,
+        ))));
     }
 
     #[test]
