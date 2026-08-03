@@ -1,0 +1,30 @@
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    open-pull-requests-limit: 20
+    schedule:
+      interval: daily
+      time: "02:00"
+      timezone: America/New_York
+    allow:
+      - dependency-type: all
+    commit-message:
+      prefix: "deps(cargo): "
+  - package-ecosystem: rust-toolchain
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    commit-message:
+      prefix: "deps(rust): "
+  - package-ecosystem: github-actions
+    directory: /
+    open-pull-requests-limit: 10
+    schedule:
+      interval: weekly
+      day: saturday
+    allow:
+      - dependency-type: all
+    commit-message:
+      prefix: "deps(ci): "
