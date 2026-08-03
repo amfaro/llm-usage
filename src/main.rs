@@ -684,7 +684,7 @@ fn dashboard_reset_width(snapshot: &Snapshot) -> usize {
 fn render_dashboard(snapshot: &Snapshot, colors: bool, layout: DashboardLayout) -> String {
     let reset_width = dashboard_reset_width(snapshot);
     let DashboardLayout { compact, bar_width } = layout;
-    let mut lines = vec![];
+    let mut lines = vec![dashboard_title(colors)];
     let mut rendered_header = false;
     for (index, provider) in snapshot.providers.iter().enumerate() {
         if index > 0 {
@@ -743,15 +743,11 @@ fn render_dashboard(snapshot: &Snapshot, colors: bool, layout: DashboardLayout) 
                 continue;
             };
             let percent = rounded_percent(used_percent);
-            let bar = usage_bar(percent, bar_width);
-            let bar = if colors {
-                format!("{}{}\x1b[0m", usage_color(percent), bar)
-            } else {
-                bar
-            };
+            let bar = colored_usage_bar(percent, bar_width, colors);
+            let percent = usage_percent(percent, colors);
             if compact {
                 lines.push(format!(
-                    "   {:>COMPACT_WINDOW_WIDTH$} [{}] {:>3}%  {:>reset_width$}",
+                    "   {:>COMPACT_WINDOW_WIDTH$} [{}] {}  {:>reset_width$}",
                     window.label,
                     bar,
                     percent,
@@ -759,7 +755,7 @@ fn render_dashboard(snapshot: &Snapshot, colors: bool, layout: DashboardLayout) 
                 ));
             } else {
                 lines.push(format!(
-                    " {:<PROVIDER_WIDTH$} {:>WINDOW_WIDTH$} [{}] {:>3}%  {:>reset_width$}",
+                    " {:<PROVIDER_WIDTH$} {:>WINDOW_WIDTH$} [{}] {}  {:>reset_width$}",
                     label,
                     window.label,
                     bar,
@@ -770,6 +766,44 @@ fn render_dashboard(snapshot: &Snapshot, colors: bool, layout: DashboardLayout) 
         }
     }
     lines.join("\n")
+}
+
+fn dashboard_title(colors: bool) -> String {
+    const TITLE: &str = " LLM USAGE";
+    const SUBTITLE: &str = " · subscription quotas";
+    if colors {
+        format!(
+            "\x1b[1;38;2;96;165;250m{TITLE}\x1b[0m{}",
+            muted_text(SUBTITLE)
+        )
+    } else {
+        format!("{TITLE}{SUBTITLE}")
+    }
+}
+
+fn colored_usage_bar(percent: u8, width: usize, colors: bool) -> String {
+    if !colors {
+        return usage_bar(percent, width);
+    }
+
+    let filled = (usize::from(percent.min(100)) * width + 50) / 100;
+    let empty = width - filled;
+    format!(
+        "{}{}\x1b[0m{}{}\x1b[0m",
+        usage_color(percent),
+        "█".repeat(filled),
+        unused_color(percent),
+        "░".repeat(empty)
+    )
+}
+
+fn usage_percent(percent: u8, colors: bool) -> String {
+    let text = format!("{percent:>3}%");
+    if colors {
+        format!("{}{}\x1b[0m", usage_color(percent), text)
+    } else {
+        text
+    }
 }
 
 fn header_text(colors: bool, reset_width: usize, bar_width: usize) -> String {
@@ -826,6 +860,16 @@ fn usage_color(percent: u8) -> &'static str {
         "\x1b[38;2;250;204;21m"
     } else {
         "\x1b[38;2;34;197;94m"
+    }
+}
+
+fn unused_color(percent: u8) -> &'static str {
+    if percent >= 90 {
+        "\x1b[38;2;252;165;165m"
+    } else if percent >= 70 {
+        "\x1b[38;2;253;230;138m"
+    } else {
+        "\x1b[38;2;134;239;172m"
     }
 }
 
@@ -933,6 +977,16 @@ mod tests {
     }
 
     #[test]
+    fn colored_usage_bar_distinguishes_used_and_available_quota() {
+        let bar = colored_usage_bar(50, 4, true);
+        assert!(bar.contains("██"));
+        assert!(bar.contains("░░"));
+        assert!(bar.contains(usage_color(50)));
+        assert!(bar.contains(unused_color(50)));
+        assert_ne!(bar, usage_bar(50, 4));
+    }
+
+    #[test]
     fn reset_text_includes_days() {
         assert_eq!(reset_text(Some(90_061), 0), "1d 01h 01m");
     }
@@ -1004,20 +1058,21 @@ mod tests {
 
         let dashboard = render_dashboard(&snapshot, false, default_layout(false));
         let lines: Vec<_> = dashboard.lines().collect();
-        assert!(lines[0].ends_with("resets in"));
+        assert_eq!(lines[0], dashboard_title(false));
+        assert!(lines[1].ends_with("resets in"));
         assert_eq!(
-            lines[1],
+            lines[2],
             provider_separator(false, RESET_WIDTH, false, BAR_WIDTH)
         );
         assert!(
-            lines[2..]
+            lines[3..]
                 .iter()
-                .all(|line| line.chars().count() == lines[0].chars().count())
+                .all(|line| line.chars().count() == lines[1].chars().count())
         );
-        assert!(lines[2].starts_with(" Codex           5h "));
-        assert!(lines[2].ends_with("1h 00m"));
-        assert!(lines[3].ends_with("1d 01h 01m"));
-        assert!(lines[4].ends_with("unavailable"));
+        assert!(lines[3].starts_with(" Codex           5h "));
+        assert!(lines[3].ends_with("1h 00m"));
+        assert!(lines[4].ends_with("1d 01h 01m"));
+        assert!(lines[5].ends_with("unavailable"));
         assert!(!dashboard.contains("Plus"));
         assert_eq!(dashboard.matches("resets in").count(), 1);
         assert!(!dashboard.contains("reset in"));
@@ -1041,7 +1096,8 @@ mod tests {
         assert_eq!(
             render_dashboard(&snapshot, false, default_layout(false)),
             format!(
-                " Codex           5h [{}]       unavailable",
+                "{}\n Codex           5h [{}]       unavailable",
+                dashboard_title(false),
                 usage_bar(0, BAR_WIDTH)
             )
         );
@@ -1123,10 +1179,11 @@ mod tests {
 
         let dashboard = render_dashboard(&snapshot, false, default_layout(true));
         let lines: Vec<_> = dashboard.lines().collect();
-        assert_eq!(lines[0], " Codex");
-        assert!(lines[1].starts_with("    5h ["));
-        assert!(lines[1].contains(&usage_bar(50, BAR_WIDTH_COMPACT)));
-        assert!(lines[1].chars().count() < 60);
+        assert_eq!(lines[0], dashboard_title(false));
+        assert_eq!(lines[1], " Codex");
+        assert!(lines[2].starts_with("    5h ["));
+        assert!(lines[2].contains(&usage_bar(50, BAR_WIDTH_COMPACT)));
+        assert!(lines[2].chars().count() < 60);
     }
 
     #[test]
@@ -1170,8 +1227,9 @@ mod tests {
         };
         let dashboard = render_dashboard(&snapshot, false, default_layout(true));
         let lines: Vec<_> = dashboard.lines().collect();
-        assert_eq!(lines[0], " Codex");
-        assert!(lines[1].contains("unavailable: Codex OAuth credential not found"));
+        assert_eq!(lines[0], dashboard_title(false));
+        assert_eq!(lines[1], " Codex");
+        assert!(lines[2].contains("unavailable: Codex OAuth credential not found"));
     }
 
     #[test]
@@ -1191,9 +1249,10 @@ mod tests {
 
         let dashboard = render_dashboard(&snapshot, false, default_layout(true));
         let lines: Vec<_> = dashboard.lines().collect();
-        assert_eq!(lines[0], " Codex");
-        assert!(lines[1].contains(&usage_bar(0, BAR_WIDTH_COMPACT)));
-        assert!(lines[1].contains("unavailable"));
+        assert_eq!(lines[0], dashboard_title(false));
+        assert_eq!(lines[1], " Codex");
+        assert!(lines[2].contains(&usage_bar(0, BAR_WIDTH_COMPACT)));
+        assert!(lines[2].contains("unavailable"));
     }
 
     #[test]
@@ -1235,12 +1294,13 @@ mod tests {
 
         let dashboard = render_dashboard(&snapshot, false, default_layout(true));
         let lines: Vec<_> = dashboard.lines().collect();
-        assert_eq!(lines[0], " Codex");
-        assert!(lines[1].starts_with("    5h ["));
-        assert!(lines[2].starts_with("    7d ["));
-        assert!(lines[3].starts_with("   30d ["));
-        assert_eq!(lines[1].find('['), lines[2].find('['));
+        assert_eq!(lines[0], dashboard_title(false));
+        assert_eq!(lines[1], " Codex");
+        assert!(lines[2].starts_with("    5h ["));
+        assert!(lines[3].starts_with("    7d ["));
+        assert!(lines[4].starts_with("   30d ["));
         assert_eq!(lines[2].find('['), lines[3].find('['));
+        assert_eq!(lines[3].find('['), lines[4].find('['));
     }
 
     #[test]
