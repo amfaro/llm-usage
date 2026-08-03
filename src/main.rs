@@ -203,8 +203,7 @@ fn is_exit_key(key: KeyEvent) -> bool {
         && matches!(
             (key.code, key.modifiers),
             (KeyCode::Char('q'), KeyModifiers::NONE)
-                | (KeyCode::Char('c'), KeyModifiers::CONTROL)
-                | (KeyCode::Char('d'), KeyModifiers::CONTROL)
+                | (KeyCode::Char('c' | 'd'), KeyModifiers::CONTROL)
         )
 }
 

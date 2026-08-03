@@ -1,0 +1,18 @@
+[tools]
+rust = [{ version = "stable", components = "clippy,rustfmt" }]
+
+[tasks.check]
+description = "Compile check"
+run = "cargo check"
+
+[tasks.test]
+description = "Run tests"
+run = "cargo test"
+
+[tasks.fmt]
+description = "Check formatting"
+run = "cargo fmt --check"
+
+[tasks.clippy]
+description = "Run clippy (pedantic)"
+run = "cargo clippy -- --deny clippy::pedantic"

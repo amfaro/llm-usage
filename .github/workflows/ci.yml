@@ -1,0 +1,29 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+      - name: Setup mise
+        uses: jdx/mise-action@v2
+      - name: Setup Cache
+        uses: useblacksmith/rust-cache@v3
+        with:
+          cache-directories: ${{ env.HOME }}/.rustup
+      - name: Compile check
+        run: mise run check
+      - name: Run tests
+        run: mise run test
+      - name: Check formatting
+        run: mise run fmt
+      - name: Run clippy
+        run: mise run clippy
