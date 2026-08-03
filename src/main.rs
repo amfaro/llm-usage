@@ -1087,4 +1087,59 @@ mod tests {
         assert!(lines[1].contains(&usage_bar(0, BAR_WIDTH_COMPACT)));
         assert!(lines[1].contains("unavailable"));
     }
+
+    #[test]
+    fn compact_layout_with_multiple_windows() {
+        let snapshot = Snapshot {
+            fetched_at: 1_000,
+            providers: vec![ProviderUsage {
+                provider: "codex",
+                available: true,
+                plan: None,
+                source: None,
+                windows: vec![
+                    UsageWindow {
+                        label: "5h",
+                        used_percent: Some(50.0),
+                        reset_at: Some(4_600),
+                        window_seconds: Some(18_000),
+                        limit_reached: None,
+                    },
+                    UsageWindow {
+                        label: "7d",
+                        used_percent: Some(25.0),
+                        reset_at: Some(10_000),
+                        window_seconds: Some(604_800),
+                        limit_reached: None,
+                    },
+                ],
+                error: None,
+                fetched_at: 1_000,
+            }],
+        };
+
+        let dashboard = render_dashboard(&snapshot, false, true);
+        let lines: Vec<_> = dashboard.lines().collect();
+        assert_eq!(lines[0], " Codex");
+        assert!(lines[1].starts_with("   5h ["));
+        assert!(lines[2].starts_with("   7d ["));
+    }
+
+    #[test]
+    fn compact_layout_with_colors() {
+        let snapshot = Snapshot {
+            fetched_at: 1_000,
+            providers: vec![ProviderUsage {
+                provider: "codex",
+                available: true,
+                plan: None,
+                source: None,
+                windows: vec![unavailable_window("5h")],
+                error: None,
+                fetched_at: 1_000,
+            }],
+        };
+
+        assert!(render_dashboard(&snapshot, true, true).contains("\x1b[38;2;156;163;175m"));
+    }
 }
