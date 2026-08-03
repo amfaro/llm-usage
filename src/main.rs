@@ -10,7 +10,7 @@ use std::{
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use crossterm::{
     event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
-    terminal::{disable_raw_mode, enable_raw_mode},
+    terminal::{disable_raw_mode, enable_raw_mode, size},
 };
 use regex::Regex;
 use reqwest::{Url, blocking::Client, redirect::Policy};
@@ -18,9 +18,11 @@ use serde::Serialize;
 use serde_json::Value;
 
 const BAR_WIDTH: usize = 28;
+const BAR_WIDTH_COMPACT: usize = 16;
 const PROVIDER_WIDTH: usize = 11;
 const WINDOW_WIDTH: usize = 6;
 const RESET_WIDTH: usize = "unavailable".len();
+const COMPACT_THRESHOLD: u16 = 60;
 const CODEX_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
 const OPENCODE_GO_URL: &str = "https://opencode.ai";
 
@@ -55,6 +57,9 @@ struct DisplayArgs {
     /// Disable ANSI colors.
     #[arg(long)]
     no_color: bool,
+    /// Force compact layout for narrow terminals.
+    #[arg(long)]
+    compact: bool,
 }
 
 #[derive(Args)]
@@ -140,6 +145,11 @@ fn main() {
 fn watch(args: &WatchArgs) -> i32 {
     let terminal = io::stdout().is_terminal();
     let colors = terminal && !args.display.no_color && env::var_os("NO_COLOR").is_none();
+    let compact = args.display.compact
+        || (terminal
+            && size()
+                .map(|(cols, _)| cols < COMPACT_THRESHOLD)
+                .unwrap_or(false));
     loop {
         let snapshot = fetch_snapshot(&args.display.query.providers);
         if terminal {
@@ -147,7 +157,7 @@ fn watch(args: &WatchArgs) -> i32 {
         }
         println!(
             "{}\n\nrefresh: {}s · q to exit",
-            render_dashboard(&snapshot, colors),
+            render_dashboard(&snapshot, colors, compact),
             args.interval
         );
         let _ = io::stdout().flush();
@@ -210,7 +220,12 @@ fn is_exit_key(key: KeyEvent) -> bool {
 fn print_once(args: &DisplayArgs) -> i32 {
     let snapshot = fetch_snapshot(&args.query.providers);
     let colors = io::stdout().is_terminal() && !args.no_color && env::var_os("NO_COLOR").is_none();
-    println!("{}", render_dashboard(&snapshot, colors));
+    let compact = args.compact
+        || (io::stdout().is_terminal()
+            && size()
+                .map(|(cols, _)| cols < COMPACT_THRESHOLD)
+                .unwrap_or(false));
+    println!("{}", render_dashboard(&snapshot, colors, compact));
     exit_code(&snapshot)
 }
 
@@ -609,7 +624,8 @@ fn opencode_window(
     })
 }
 
-fn render_dashboard(snapshot: &Snapshot, colors: bool) -> String {
+#[allow(clippy::too_many_lines)]
+fn render_dashboard(snapshot: &Snapshot, colors: bool, compact: bool) -> String {
     let reset_width = snapshot
         .providers
         .iter()
@@ -621,11 +637,16 @@ fn render_dashboard(snapshot: &Snapshot, colors: bool) -> String {
         })
         .map(|text| text.chars().count())
         .fold(RESET_WIDTH, usize::max);
+    let bar_width = if compact {
+        BAR_WIDTH_COMPACT
+    } else {
+        BAR_WIDTH
+    };
     let mut lines = vec![];
     let mut rendered_header = false;
     for (index, provider) in snapshot.providers.iter().enumerate() {
         if index > 0 {
-            lines.push(provider_separator(colors, reset_width));
+            lines.push(provider_separator(colors, reset_width, compact));
         }
         let label = match provider.provider {
             "codex" => Provider::Codex.label(),
@@ -633,11 +654,19 @@ fn render_dashboard(snapshot: &Snapshot, colors: bool) -> String {
             _ => provider.provider,
         };
         if !provider.available {
-            lines.push(format!(
-                " {:<PROVIDER_WIDTH$} unavailable: {}",
-                label,
-                provider.error.unwrap_or("usage unavailable")
-            ));
+            if compact {
+                lines.push(format!(" {label}"));
+                lines.push(format!(
+                    "   unavailable: {}",
+                    provider.error.unwrap_or("usage unavailable")
+                ));
+            } else {
+                lines.push(format!(
+                    " {:<PROVIDER_WIDTH$} unavailable: {}",
+                    label,
+                    provider.error.unwrap_or("usage unavailable")
+                ));
+            }
             continue;
         }
         if !rendered_header
@@ -645,36 +674,57 @@ fn render_dashboard(snapshot: &Snapshot, colors: bool) -> String {
                 .windows
                 .iter()
                 .any(|window| window.used_percent.is_some())
+            && !compact
         {
             lines.push(header_text(colors, reset_width));
-            lines.push(provider_separator(colors, reset_width));
+            lines.push(provider_separator(colors, reset_width, false));
             rendered_header = true;
+        }
+        if compact {
+            lines.push(format!(" {label}"));
         }
         for window in &provider.windows {
             let Some(used_percent) = window.used_percent else {
-                let bar = usage_bar(0, BAR_WIDTH);
+                let bar = usage_bar(0, bar_width);
                 let bar = if colors { muted_text(&bar) } else { bar };
-                lines.push(format!(
-                    " {:<PROVIDER_WIDTH$} {:>WINDOW_WIDTH$} [{}] {:>3}   {:>reset_width$}",
-                    label, window.label, bar, "", "unavailable"
-                ));
+                if compact {
+                    lines.push(format!(
+                        "   {} [{}] {:>3}   {:>reset_width$}",
+                        window.label, bar, "", "unavailable"
+                    ));
+                } else {
+                    lines.push(format!(
+                        " {:<PROVIDER_WIDTH$} {:>WINDOW_WIDTH$} [{}] {:>3}   {:>reset_width$}",
+                        label, window.label, bar, "", "unavailable"
+                    ));
+                }
                 continue;
             };
             let percent = rounded_percent(used_percent);
-            let bar = usage_bar(percent, BAR_WIDTH);
+            let bar = usage_bar(percent, bar_width);
             let bar = if colors {
                 format!("{}{}\x1b[0m", usage_color(percent), bar)
             } else {
                 bar
             };
-            lines.push(format!(
-                " {:<PROVIDER_WIDTH$} {:>WINDOW_WIDTH$} [{}] {:>3}%  {:>reset_width$}",
-                label,
-                window.label,
-                bar,
-                percent,
-                reset_text(window.reset_at, snapshot.fetched_at)
-            ));
+            if compact {
+                lines.push(format!(
+                    "   {} [{}] {:>3}%  {:>reset_width$}",
+                    window.label,
+                    bar,
+                    percent,
+                    reset_text(window.reset_at, snapshot.fetched_at)
+                ));
+            } else {
+                lines.push(format!(
+                    " {:<PROVIDER_WIDTH$} {:>WINDOW_WIDTH$} [{}] {:>3}%  {:>reset_width$}",
+                    label,
+                    window.label,
+                    bar,
+                    percent,
+                    reset_text(window.reset_at, snapshot.fetched_at)
+                ));
+            }
         }
     }
     lines.join("\n")
@@ -688,8 +738,13 @@ fn header_text(colors: bool, reset_width: usize) -> String {
     if colors { muted_text(&header) } else { header }
 }
 
-fn provider_separator(colors: bool, reset_width: usize) -> String {
-    let separator = "─".repeat(header_text(false, reset_width).chars().count());
+fn provider_separator(colors: bool, reset_width: usize, compact: bool) -> String {
+    let width = if compact {
+        3 + WINDOW_WIDTH + 1 + 2 + BAR_WIDTH_COMPACT + 1 + 4 + 2 + reset_width
+    } else {
+        header_text(false, reset_width).chars().count()
+    };
+    let separator = "─".repeat(width);
     if colors {
         muted_text(&separator)
     } else {
@@ -845,10 +900,10 @@ mod tests {
             }],
         };
 
-        let dashboard = render_dashboard(&snapshot, false);
+        let dashboard = render_dashboard(&snapshot, false, false);
         let lines: Vec<_> = dashboard.lines().collect();
         assert!(lines[0].ends_with("resets in"));
-        assert_eq!(lines[1], provider_separator(false, RESET_WIDTH));
+        assert_eq!(lines[1], provider_separator(false, RESET_WIDTH, false));
         assert!(
             lines[2..]
                 .iter()
@@ -879,13 +934,13 @@ mod tests {
         };
 
         assert_eq!(
-            render_dashboard(&snapshot, false),
+            render_dashboard(&snapshot, false, false),
             format!(
                 " Codex           5h [{}]       unavailable",
                 usage_bar(0, BAR_WIDTH)
             )
         );
-        assert!(render_dashboard(&snapshot, true).contains("\x1b[38;2;156;163;175m"));
+        assert!(render_dashboard(&snapshot, true, false).contains("\x1b[38;2;156;163;175m"));
     }
 
     #[test]
@@ -912,11 +967,11 @@ mod tests {
             ],
         };
 
-        let dashboard = render_dashboard(&snapshot, false);
+        let dashboard = render_dashboard(&snapshot, false, false);
         assert!(
             dashboard
                 .lines()
-                .any(|line| line == provider_separator(false, RESET_WIDTH))
+                .any(|line| line == provider_separator(false, RESET_WIDTH, false))
         );
     }
 
@@ -931,9 +986,105 @@ mod tests {
             )],
         };
         assert!(
-            render_dashboard(&snapshot, false)
+            render_dashboard(&snapshot, false, false)
                 .contains("unavailable: Codex OAuth credential not found")
         );
         assert_eq!(exit_code(&snapshot), 1);
+    }
+
+    #[test]
+    fn compact_layout_stacks_provider_and_uses_narrow_bars() {
+        let snapshot = Snapshot {
+            fetched_at: 1_000,
+            providers: vec![ProviderUsage {
+                provider: "codex",
+                available: true,
+                plan: None,
+                source: None,
+                windows: vec![UsageWindow {
+                    label: "5h",
+                    used_percent: Some(50.0),
+                    reset_at: Some(4_600),
+                    window_seconds: Some(18_000),
+                    limit_reached: None,
+                }],
+                error: None,
+                fetched_at: 1_000,
+            }],
+        };
+
+        let dashboard = render_dashboard(&snapshot, false, true);
+        let lines: Vec<_> = dashboard.lines().collect();
+        assert_eq!(lines[0], " Codex");
+        assert!(lines[1].starts_with("   5h ["));
+        assert!(lines[1].contains(&usage_bar(50, BAR_WIDTH_COMPACT)));
+        assert!(lines[1].chars().count() < 60);
+    }
+
+    #[test]
+    fn compact_layout_separates_providers() {
+        let snapshot = Snapshot {
+            fetched_at: 1_000,
+            providers: vec![
+                ProviderUsage {
+                    provider: "codex",
+                    available: true,
+                    plan: None,
+                    source: None,
+                    windows: vec![UsageWindow {
+                        label: "5h",
+                        used_percent: Some(50.0),
+                        reset_at: Some(4_600),
+                        window_seconds: Some(18_000),
+                        limit_reached: None,
+                    }],
+                    error: None,
+                    fetched_at: 1_000,
+                },
+                unavailable(Provider::OpencodeGo, "credentials missing", 1_000),
+            ],
+        };
+
+        let dashboard = render_dashboard(&snapshot, false, true);
+        let separator = provider_separator(false, RESET_WIDTH, true);
+        assert!(dashboard.contains(&separator));
+    }
+
+    #[test]
+    fn compact_layout_shows_unavailable_provider() {
+        let snapshot = Snapshot {
+            fetched_at: 1_000,
+            providers: vec![unavailable(
+                Provider::Codex,
+                "Codex OAuth credential not found",
+                1_000,
+            )],
+        };
+        let dashboard = render_dashboard(&snapshot, false, true);
+        let lines: Vec<_> = dashboard.lines().collect();
+        assert_eq!(lines[0], " Codex");
+        assert!(lines[1].contains("unavailable: Codex OAuth credential not found"));
+    }
+
+    #[test]
+    fn compact_layout_mutes_unavailable_window() {
+        let snapshot = Snapshot {
+            fetched_at: 1_000,
+            providers: vec![ProviderUsage {
+                provider: "codex",
+                available: true,
+                plan: None,
+                source: None,
+                windows: vec![unavailable_window("5h")],
+                error: None,
+                fetched_at: 1_000,
+            }],
+        };
+
+        let dashboard = render_dashboard(&snapshot, false, true);
+        let lines: Vec<_> = dashboard.lines().collect();
+        assert_eq!(lines[0], " Codex");
+        assert!(lines[1].contains(&usage_bar(0, BAR_WIDTH_COMPACT)));
+        assert!(lines[1].contains("unavailable"));
     }
 }
