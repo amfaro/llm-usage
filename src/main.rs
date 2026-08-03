@@ -20,7 +20,7 @@ use serde_json::Value;
 const BAR_WIDTH: usize = 28;
 const PROVIDER_WIDTH: usize = 11;
 const WINDOW_WIDTH: usize = 6;
-const RESET_WIDTH: usize = 9;
+const RESET_WIDTH: usize = "unavailable".len();
 const CODEX_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
 const OPENCODE_GO_URL: &str = "https://opencode.ai";
 
@@ -611,11 +611,22 @@ fn opencode_window(
 }
 
 fn render_dashboard(snapshot: &Snapshot, colors: bool) -> String {
+    let reset_width = snapshot
+        .providers
+        .iter()
+        .flat_map(|provider| provider.windows.iter())
+        .filter_map(|window| {
+            window
+                .reset_at
+                .map(|reset_at| reset_text(Some(reset_at), snapshot.fetched_at))
+        })
+        .map(|text| text.chars().count())
+        .fold(RESET_WIDTH, usize::max);
     let mut lines = vec![];
     let mut rendered_header = false;
     for (index, provider) in snapshot.providers.iter().enumerate() {
         if index > 0 {
-            lines.push(provider_separator(colors));
+            lines.push(provider_separator(colors, reset_width));
         }
         let label = match provider.provider {
             "codex" => Provider::Codex.label(),
@@ -636,8 +647,8 @@ fn render_dashboard(snapshot: &Snapshot, colors: bool) -> String {
                 .iter()
                 .any(|window| window.used_percent.is_some())
         {
-            lines.push(header_text(colors));
-            lines.push(provider_separator(colors));
+            lines.push(header_text(colors, reset_width));
+            lines.push(provider_separator(colors, reset_width));
             rendered_header = true;
         }
         for window in &provider.windows {
@@ -645,7 +656,7 @@ fn render_dashboard(snapshot: &Snapshot, colors: bool) -> String {
                 let bar = usage_bar(0, BAR_WIDTH);
                 let bar = if colors { muted_text(&bar) } else { bar };
                 lines.push(format!(
-                    " {:<PROVIDER_WIDTH$} {:>WINDOW_WIDTH$} [{}] {:>3}  {:>RESET_WIDTH$}",
+                    " {:<PROVIDER_WIDTH$} {:>WINDOW_WIDTH$} [{}] {:>3}   {:>reset_width$}",
                     label, window.label, bar, "", "unavailable"
                 ));
                 continue;
@@ -658,7 +669,7 @@ fn render_dashboard(snapshot: &Snapshot, colors: bool) -> String {
                 bar
             };
             lines.push(format!(
-                " {:<PROVIDER_WIDTH$} {:>WINDOW_WIDTH$} [{}] {:>3}%  {:>RESET_WIDTH$}",
+                " {:<PROVIDER_WIDTH$} {:>WINDOW_WIDTH$} [{}] {:>3}%  {:>reset_width$}",
                 label,
                 window.label,
                 bar,
@@ -670,16 +681,16 @@ fn render_dashboard(snapshot: &Snapshot, colors: bool) -> String {
     lines.join("\n")
 }
 
-fn header_text(colors: bool) -> String {
+fn header_text(colors: bool, reset_width: usize) -> String {
     let header = format!(
-        " {:<PROVIDER_WIDTH$} {:>WINDOW_WIDTH$} {:<35}  {:>RESET_WIDTH$}",
+        " {:<PROVIDER_WIDTH$} {:>WINDOW_WIDTH$} {:<35}  {:>reset_width$}",
         "provider", "meter", "usage", "resets in"
     );
     if colors { muted_text(&header) } else { header }
 }
 
-fn provider_separator(colors: bool) -> String {
-    let separator = "─".repeat(header_text(false).chars().count());
+fn provider_separator(colors: bool, reset_width: usize) -> String {
+    let separator = "─".repeat(header_text(false, reset_width).chars().count());
     if colors {
         muted_text(&separator)
     } else {
@@ -721,9 +732,12 @@ fn reset_text(reset_at: Option<u64>, now: u64) -> String {
     if seconds == 0 {
         return "now".to_owned();
     }
-    let hours = seconds / 3600;
+    let days = seconds / 86_400;
+    let hours = (seconds % 86_400) / 3600;
     let minutes = (seconds % 3600) / 60;
-    if hours > 0 {
+    if days > 0 {
+        format!("{days}d {hours:02}h {minutes:02}m")
+    } else if hours > 0 {
         format!("{hours}h {minutes:02}m")
     } else {
         format!("{minutes}m")
@@ -760,6 +774,11 @@ mod tests {
         assert_eq!(usage_bar(50, 4), "██░░");
         assert_eq!(usage_bar(100, 4), "████");
         assert_eq!(rounded_percent(100.1), 100);
+    }
+
+    #[test]
+    fn reset_text_includes_days() {
+        assert_eq!(reset_text(Some(90_061), 0), "1d 01h 01m");
     }
 
     #[test]
@@ -805,13 +824,23 @@ mod tests {
                 available: true,
                 plan: Some("Plus".to_owned()),
                 source: None,
-                windows: vec![UsageWindow {
-                    label: "5h",
-                    used_percent: Some(50.0),
-                    reset_at: Some(4_600),
-                    window_seconds: Some(18_000),
-                    limit_reached: None,
-                }],
+                windows: vec![
+                    UsageWindow {
+                        label: "5h",
+                        used_percent: Some(50.0),
+                        reset_at: Some(4_600),
+                        window_seconds: Some(18_000),
+                        limit_reached: None,
+                    },
+                    UsageWindow {
+                        label: "7d",
+                        used_percent: Some(50.0),
+                        reset_at: Some(91_061),
+                        window_seconds: Some(604_800),
+                        limit_reached: None,
+                    },
+                    unavailable_window("month"),
+                ],
                 error: None,
                 fetched_at: 1_000,
             }],
@@ -819,14 +848,17 @@ mod tests {
 
         let dashboard = render_dashboard(&snapshot, false);
         let lines: Vec<_> = dashboard.lines().collect();
-        assert_eq!(
-            lines[0],
-            " provider     meter usage                                resets in"
+        assert!(lines[0].ends_with("resets in"));
+        assert_eq!(lines[1], provider_separator(false, RESET_WIDTH));
+        assert!(
+            lines[2..]
+                .iter()
+                .all(|line| line.chars().count() == lines[0].chars().count())
         );
-        assert_eq!(lines[1], provider_separator(false));
-        assert_eq!(lines[2].chars().count(), lines[0].chars().count());
         assert!(lines[2].starts_with(" Codex           5h "));
         assert!(lines[2].ends_with("1h 00m"));
+        assert!(lines[3].ends_with("1d 01h 01m"));
+        assert!(lines[4].ends_with("unavailable"));
         assert!(!dashboard.contains("Plus"));
         assert_eq!(dashboard.matches("resets in").count(), 1);
         assert!(!dashboard.contains("reset in"));
@@ -850,7 +882,7 @@ mod tests {
         assert_eq!(
             render_dashboard(&snapshot, false),
             format!(
-                " Codex           5h [{}]      unavailable",
+                " Codex           5h [{}]       unavailable",
                 usage_bar(0, BAR_WIDTH)
             )
         );
@@ -885,7 +917,7 @@ mod tests {
         assert!(
             dashboard
                 .lines()
-                .any(|line| line == provider_separator(false))
+                .any(|line| line == provider_separator(false, RESET_WIDTH))
         );
     }
 
