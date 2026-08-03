@@ -21,6 +21,7 @@ const BAR_WIDTH: usize = 28;
 const BAR_WIDTH_COMPACT: usize = 16;
 const PROVIDER_WIDTH: usize = 11;
 const WINDOW_WIDTH: usize = 6;
+const COMPACT_WINDOW_WIDTH: usize = 3;
 const RESET_WIDTH: usize = "unavailable".len();
 const COMPACT_THRESHOLD: u16 = 80;
 const CODEX_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
@@ -698,7 +699,7 @@ fn render_dashboard(snapshot: &Snapshot, colors: bool, compact: bool) -> String 
                 let bar = if colors { muted_text(&bar) } else { bar };
                 if compact {
                     lines.push(format!(
-                        "   {} [{}] {:>3}   {:>reset_width$}",
+                        "   {:>COMPACT_WINDOW_WIDTH$} [{}] {:>3}   {:>reset_width$}",
                         window.label, bar, "", "unavailable"
                     ));
                 } else {
@@ -718,7 +719,7 @@ fn render_dashboard(snapshot: &Snapshot, colors: bool, compact: bool) -> String 
             };
             if compact {
                 lines.push(format!(
-                    "   {} [{}] {:>3}%  {:>reset_width$}",
+                    "   {:>COMPACT_WINDOW_WIDTH$} [{}] {:>3}%  {:>reset_width$}",
                     window.label,
                     bar,
                     percent,
@@ -749,7 +750,7 @@ fn header_text(colors: bool, reset_width: usize) -> String {
 
 fn provider_separator(colors: bool, reset_width: usize, compact: bool) -> String {
     let width = if compact {
-        3 + WINDOW_WIDTH + 1 + 2 + BAR_WIDTH_COMPACT + 1 + 4 + 2 + reset_width
+        3 + COMPACT_WINDOW_WIDTH + 1 + 2 + BAR_WIDTH_COMPACT + 1 + 4 + 2 + reset_width
     } else {
         header_text(false, reset_width).chars().count()
     };
@@ -1034,7 +1035,7 @@ mod tests {
         let dashboard = render_dashboard(&snapshot, false, true);
         let lines: Vec<_> = dashboard.lines().collect();
         assert_eq!(lines[0], " Codex");
-        assert!(lines[1].starts_with("   5h ["));
+        assert!(lines[1].starts_with("    5h ["));
         assert!(lines[1].contains(&usage_bar(50, BAR_WIDTH_COMPACT)));
         assert!(lines[1].chars().count() < 60);
     }
@@ -1130,6 +1131,13 @@ mod tests {
                         window_seconds: Some(604_800),
                         limit_reached: None,
                     },
+                    UsageWindow {
+                        label: "30d",
+                        used_percent: Some(10.0),
+                        reset_at: Some(100_000),
+                        window_seconds: Some(2_592_000),
+                        limit_reached: None,
+                    },
                 ],
                 error: None,
                 fetched_at: 1_000,
@@ -1139,8 +1147,11 @@ mod tests {
         let dashboard = render_dashboard(&snapshot, false, true);
         let lines: Vec<_> = dashboard.lines().collect();
         assert_eq!(lines[0], " Codex");
-        assert!(lines[1].starts_with("   5h ["));
-        assert!(lines[2].starts_with("   7d ["));
+        assert!(lines[1].starts_with("    5h ["));
+        assert!(lines[2].starts_with("    7d ["));
+        assert!(lines[3].starts_with("   30d ["));
+        assert_eq!(lines[1].find('['), lines[2].find('['));
+        assert_eq!(lines[2].find('['), lines[3].find('['));
     }
 
     #[test]
