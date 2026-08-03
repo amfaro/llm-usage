@@ -23,7 +23,6 @@ const PROVIDER_WIDTH: usize = 11;
 const WINDOW_WIDTH: usize = 6;
 const COMPACT_WINDOW_WIDTH: usize = 3;
 const RESET_WIDTH: usize = "unavailable".len();
-const COMPACT_THRESHOLD: u16 = 80;
 const CODEX_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
 const OPENCODE_GO_URL: &str = "https://opencode.ai";
 
@@ -147,22 +146,18 @@ fn watch(args: &WatchArgs) -> i32 {
     let terminal = io::stdout().is_terminal();
     let colors = terminal && !args.display.no_color && env::var_os("NO_COLOR").is_none();
     loop {
-        let compact = compact_layout(
-            args.display.compact,
-            terminal
-                .then(size)
-                .and_then(Result::ok)
-                .map(|(cols, _)| cols),
-        );
+        let dimensions = terminal.then(size).and_then(Result::ok);
         let snapshot = fetch_snapshot(&args.display.query.providers);
+        let layout = dashboard_layout(
+            &snapshot,
+            args.display.compact,
+            dimensions.map(|(columns, _)| columns),
+        );
+        let dashboard = render_dashboard(&snapshot, colors, layout);
         if terminal {
             print!("\x1b[2J\x1b[H");
         }
-        println!(
-            "{}\n\nrefresh: {}s · q to exit",
-            render_dashboard(&snapshot, colors, compact),
-            args.interval
-        );
+        println!("{dashboard}\n\nrefresh: {}s · q to exit", args.interval);
         let _ = io::stdout().flush();
         let raw_mode = io::stdin()
             .is_terminal()
@@ -238,14 +233,12 @@ fn print_once(args: &DisplayArgs) -> i32 {
     let snapshot = fetch_snapshot(&args.query.providers);
     let terminal = io::stdout().is_terminal();
     let colors = terminal && !args.no_color && env::var_os("NO_COLOR").is_none();
-    let compact = compact_layout(
-        args.compact,
-        terminal
-            .then(size)
-            .and_then(Result::ok)
-            .map(|(cols, _)| cols),
-    );
-    println!("{}", render_dashboard(&snapshot, colors, compact));
+    let columns = terminal
+        .then(size)
+        .and_then(Result::ok)
+        .map(|(columns, _)| columns);
+    let layout = dashboard_layout(&snapshot, args.compact, columns);
+    println!("{}", render_dashboard(&snapshot, colors, layout));
     exit_code(&snapshot)
 }
 
@@ -258,8 +251,33 @@ fn print_json(args: &QueryArgs) -> i32 {
     exit_code(&snapshot)
 }
 
-fn compact_layout(force: bool, columns: Option<u16>) -> bool {
-    force || columns.is_some_and(|columns| columns <= COMPACT_THRESHOLD)
+#[derive(Clone, Copy)]
+struct DashboardLayout {
+    compact: bool,
+    bar_width: usize,
+}
+
+fn dashboard_layout(
+    snapshot: &Snapshot,
+    force_compact: bool,
+    columns: Option<u16>,
+) -> DashboardLayout {
+    let reset_width = dashboard_reset_width(snapshot);
+    let full_fixed_width = full_width(reset_width, 0);
+    let compact_fixed_width = compact_width(reset_width, 0);
+    let compact = force_compact
+        || columns
+            .is_some_and(|columns| usize::from(columns) < full_fixed_width + BAR_WIDTH_COMPACT);
+    let (fixed_width, default_bar_width) = if compact {
+        (compact_fixed_width, BAR_WIDTH_COMPACT)
+    } else {
+        (full_fixed_width, BAR_WIDTH)
+    };
+    let bar_width = columns.map_or(default_bar_width, |columns| {
+        usize::from(columns).saturating_sub(fixed_width).max(1)
+    });
+
+    DashboardLayout { compact, bar_width }
 }
 
 fn exit_code(snapshot: &Snapshot) -> i32 {
@@ -648,9 +666,8 @@ fn opencode_window(
     })
 }
 
-#[allow(clippy::too_many_lines)]
-fn render_dashboard(snapshot: &Snapshot, colors: bool, compact: bool) -> String {
-    let reset_width = snapshot
+fn dashboard_reset_width(snapshot: &Snapshot) -> usize {
+    snapshot
         .providers
         .iter()
         .flat_map(|provider| provider.windows.iter())
@@ -660,17 +677,18 @@ fn render_dashboard(snapshot: &Snapshot, colors: bool, compact: bool) -> String 
                 .map(|reset_at| reset_text(Some(reset_at), snapshot.fetched_at))
         })
         .map(|text| text.chars().count())
-        .fold(RESET_WIDTH, usize::max);
-    let bar_width = if compact {
-        BAR_WIDTH_COMPACT
-    } else {
-        BAR_WIDTH
-    };
+        .fold(RESET_WIDTH, usize::max)
+}
+
+#[allow(clippy::too_many_lines)]
+fn render_dashboard(snapshot: &Snapshot, colors: bool, layout: DashboardLayout) -> String {
+    let reset_width = dashboard_reset_width(snapshot);
+    let DashboardLayout { compact, bar_width } = layout;
     let mut lines = vec![];
     let mut rendered_header = false;
     for (index, provider) in snapshot.providers.iter().enumerate() {
         if index > 0 {
-            lines.push(provider_separator(colors, reset_width, compact));
+            lines.push(provider_separator(colors, reset_width, compact, bar_width));
         }
         let label = match provider.provider {
             "codex" => Provider::Codex.label(),
@@ -700,8 +718,8 @@ fn render_dashboard(snapshot: &Snapshot, colors: bool, compact: bool) -> String 
                 .any(|window| window.used_percent.is_some())
             && !compact
         {
-            lines.push(header_text(colors, reset_width));
-            lines.push(provider_separator(colors, reset_width, false));
+            lines.push(header_text(colors, reset_width, bar_width));
+            lines.push(provider_separator(colors, reset_width, false, bar_width));
             rendered_header = true;
         }
         if compact {
@@ -754,19 +772,28 @@ fn render_dashboard(snapshot: &Snapshot, colors: bool, compact: bool) -> String 
     lines.join("\n")
 }
 
-fn header_text(colors: bool, reset_width: usize) -> String {
+fn header_text(colors: bool, reset_width: usize, bar_width: usize) -> String {
+    let usage_width = bar_width + 7;
     let header = format!(
-        " {:<PROVIDER_WIDTH$} {:>WINDOW_WIDTH$} {:<35}  {:>reset_width$}",
+        " {:<PROVIDER_WIDTH$} {:>WINDOW_WIDTH$} {:<usage_width$}  {:>reset_width$}",
         "provider", "meter", "usage", "resets in"
     );
     if colors { muted_text(&header) } else { header }
 }
 
-fn provider_separator(colors: bool, reset_width: usize, compact: bool) -> String {
+fn full_width(reset_width: usize, bar_width: usize) -> usize {
+    header_text(false, reset_width, bar_width).chars().count()
+}
+
+fn compact_width(reset_width: usize, bar_width: usize) -> usize {
+    3 + COMPACT_WINDOW_WIDTH + 1 + 2 + bar_width + 1 + 4 + 2 + reset_width
+}
+
+fn provider_separator(colors: bool, reset_width: usize, compact: bool, bar_width: usize) -> String {
     let width = if compact {
-        3 + COMPACT_WINDOW_WIDTH + 1 + 2 + BAR_WIDTH_COMPACT + 1 + 4 + 2 + reset_width
+        compact_width(reset_width, bar_width)
     } else {
-        header_text(false, reset_width).chars().count()
+        full_width(reset_width, bar_width)
     };
     let separator = "─".repeat(width);
     if colors {
@@ -837,13 +864,46 @@ fn home_dir() -> Option<PathBuf> {
 mod tests {
     use super::*;
 
+    fn default_layout(compact: bool) -> DashboardLayout {
+        DashboardLayout {
+            compact,
+            bar_width: if compact {
+                BAR_WIDTH_COMPACT
+            } else {
+                BAR_WIDTH
+            },
+        }
+    }
+
+    fn empty_snapshot() -> Snapshot {
+        Snapshot {
+            fetched_at: 1_000,
+            providers: Vec::new(),
+        }
+    }
+
     #[test]
-    fn compact_layout_uses_flag_or_narrow_terminal() {
-        assert!(compact_layout(true, None));
-        assert!(compact_layout(false, Some(COMPACT_THRESHOLD)));
-        assert!(compact_layout(false, Some(COMPACT_THRESHOLD - 1)));
-        assert!(!compact_layout(false, Some(COMPACT_THRESHOLD + 1)));
-        assert!(!compact_layout(false, None));
+    fn layout_uses_full_view_when_it_fits() {
+        let snapshot = empty_snapshot();
+        let minimum_full_width = full_width(RESET_WIDTH, BAR_WIDTH_COMPACT);
+
+        assert!(dashboard_layout(&snapshot, true, None).compact);
+        assert!(dashboard_layout(&snapshot, false, Some(minimum_full_width as u16 - 1)).compact);
+        assert!(!dashboard_layout(&snapshot, false, Some(minimum_full_width as u16)).compact);
+        assert!(!dashboard_layout(&snapshot, false, None).compact);
+    }
+
+    #[test]
+    fn layout_expands_bars_to_available_width() {
+        let snapshot = empty_snapshot();
+        let narrow = dashboard_layout(&snapshot, false, Some(70));
+        let wide = dashboard_layout(&snapshot, false, Some(100));
+        let compact = dashboard_layout(&snapshot, true, Some(70));
+
+        assert!(wide.bar_width > narrow.bar_width);
+        assert!(compact.bar_width > BAR_WIDTH_COMPACT);
+        assert_eq!(full_width(RESET_WIDTH, wide.bar_width), 100);
+        assert_eq!(compact_width(RESET_WIDTH, compact.bar_width), 70);
     }
 
     #[test]
@@ -942,10 +1002,13 @@ mod tests {
             }],
         };
 
-        let dashboard = render_dashboard(&snapshot, false, false);
+        let dashboard = render_dashboard(&snapshot, false, default_layout(false));
         let lines: Vec<_> = dashboard.lines().collect();
         assert!(lines[0].ends_with("resets in"));
-        assert_eq!(lines[1], provider_separator(false, RESET_WIDTH, false));
+        assert_eq!(
+            lines[1],
+            provider_separator(false, RESET_WIDTH, false, BAR_WIDTH)
+        );
         assert!(
             lines[2..]
                 .iter()
@@ -976,13 +1039,16 @@ mod tests {
         };
 
         assert_eq!(
-            render_dashboard(&snapshot, false, false),
+            render_dashboard(&snapshot, false, default_layout(false)),
             format!(
                 " Codex           5h [{}]       unavailable",
                 usage_bar(0, BAR_WIDTH)
             )
         );
-        assert!(render_dashboard(&snapshot, true, false).contains("\x1b[38;2;156;163;175m"));
+        assert!(
+            render_dashboard(&snapshot, true, default_layout(false))
+                .contains("\x1b[38;2;156;163;175m")
+        );
     }
 
     #[test]
@@ -1009,11 +1075,11 @@ mod tests {
             ],
         };
 
-        let dashboard = render_dashboard(&snapshot, false, false);
+        let dashboard = render_dashboard(&snapshot, false, default_layout(false));
         assert!(
             dashboard
                 .lines()
-                .any(|line| line == provider_separator(false, RESET_WIDTH, false))
+                .any(|line| line == provider_separator(false, RESET_WIDTH, false, BAR_WIDTH))
         );
     }
 
@@ -1028,7 +1094,7 @@ mod tests {
             )],
         };
         assert!(
-            render_dashboard(&snapshot, false, false)
+            render_dashboard(&snapshot, false, default_layout(false))
                 .contains("unavailable: Codex OAuth credential not found")
         );
         assert_eq!(exit_code(&snapshot), 1);
@@ -1055,7 +1121,7 @@ mod tests {
             }],
         };
 
-        let dashboard = render_dashboard(&snapshot, false, true);
+        let dashboard = render_dashboard(&snapshot, false, default_layout(true));
         let lines: Vec<_> = dashboard.lines().collect();
         assert_eq!(lines[0], " Codex");
         assert!(lines[1].starts_with("    5h ["));
@@ -1087,8 +1153,8 @@ mod tests {
             ],
         };
 
-        let dashboard = render_dashboard(&snapshot, false, true);
-        let separator = provider_separator(false, RESET_WIDTH, true);
+        let dashboard = render_dashboard(&snapshot, false, default_layout(true));
+        let separator = provider_separator(false, RESET_WIDTH, true, BAR_WIDTH_COMPACT);
         assert!(dashboard.contains(&separator));
     }
 
@@ -1102,7 +1168,7 @@ mod tests {
                 1_000,
             )],
         };
-        let dashboard = render_dashboard(&snapshot, false, true);
+        let dashboard = render_dashboard(&snapshot, false, default_layout(true));
         let lines: Vec<_> = dashboard.lines().collect();
         assert_eq!(lines[0], " Codex");
         assert!(lines[1].contains("unavailable: Codex OAuth credential not found"));
@@ -1123,7 +1189,7 @@ mod tests {
             }],
         };
 
-        let dashboard = render_dashboard(&snapshot, false, true);
+        let dashboard = render_dashboard(&snapshot, false, default_layout(true));
         let lines: Vec<_> = dashboard.lines().collect();
         assert_eq!(lines[0], " Codex");
         assert!(lines[1].contains(&usage_bar(0, BAR_WIDTH_COMPACT)));
@@ -1167,7 +1233,7 @@ mod tests {
             }],
         };
 
-        let dashboard = render_dashboard(&snapshot, false, true);
+        let dashboard = render_dashboard(&snapshot, false, default_layout(true));
         let lines: Vec<_> = dashboard.lines().collect();
         assert_eq!(lines[0], " Codex");
         assert!(lines[1].starts_with("    5h ["));
@@ -1192,6 +1258,9 @@ mod tests {
             }],
         };
 
-        assert!(render_dashboard(&snapshot, true, true).contains("\x1b[38;2;156;163;175m"));
+        assert!(
+            render_dashboard(&snapshot, true, default_layout(true))
+                .contains("\x1b[38;2;156;163;175m")
+        );
     }
 }
