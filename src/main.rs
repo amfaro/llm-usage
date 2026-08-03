@@ -10,6 +10,7 @@ use std::{
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use crossterm::{
     event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
+    style::{Attribute, Color, ResetColor, SetAttribute, SetForegroundColor},
     terminal::{disable_raw_mode, enable_raw_mode, size},
 };
 use regex::Regex;
@@ -773,7 +774,10 @@ fn dashboard_title(colors: bool) -> String {
     const SUBTITLE: &str = " · subscription quotas";
     if colors {
         format!(
-            "\x1b[1;38;2;96;165;250m{TITLE}\x1b[0m{}",
+            "{}{}{TITLE}{}{}",
+            SetAttribute(Attribute::Bold),
+            SetForegroundColor(Color::Blue),
+            SetAttribute(Attribute::Reset),
             muted_text(SUBTITLE)
         )
     } else {
@@ -789,18 +793,19 @@ fn colored_usage_bar(percent: u8, width: usize, colors: bool) -> String {
     let filled = (usize::from(percent.min(100)) * width + 50) / 100;
     let empty = width - filled;
     format!(
-        "{}{}\x1b[0m{}{}\x1b[0m",
-        usage_color(percent),
+        "{}{}{}{}{}",
+        SetForegroundColor(usage_color(percent)),
         "█".repeat(filled),
-        unused_color(percent),
-        "░".repeat(empty)
+        SetForegroundColor(unused_color(percent)),
+        "░".repeat(empty),
+        ResetColor
     )
 }
 
 fn usage_percent(percent: u8, colors: bool) -> String {
     let text = format!("{percent:>3}%");
     if colors {
-        format!("{}{}\x1b[0m", usage_color(percent), text)
+        color_text(&text, usage_color(percent))
     } else {
         text
     }
@@ -838,7 +843,11 @@ fn provider_separator(colors: bool, reset_width: usize, compact: bool, bar_width
 }
 
 fn muted_text(text: &str) -> String {
-    format!("\x1b[38;2;156;163;175m{text}\x1b[0m")
+    color_text(text, Color::DarkGrey)
+}
+
+fn color_text(text: &str, color: Color) -> String {
+    format!("{}{text}{}", SetForegroundColor(color), ResetColor)
 }
 
 fn rounded_percent(percent: f64) -> u8 {
@@ -853,23 +862,23 @@ fn usage_bar(percent: u8, width: usize) -> String {
     format!("{}{}", "█".repeat(filled), "░".repeat(width - filled))
 }
 
-fn usage_color(percent: u8) -> &'static str {
+fn usage_color(percent: u8) -> Color {
     if percent >= 90 {
-        "\x1b[38;2;239;68;68m"
+        Color::DarkRed
     } else if percent >= 70 {
-        "\x1b[38;2;250;204;21m"
+        Color::DarkYellow
     } else {
-        "\x1b[38;2;34;197;94m"
+        Color::DarkGreen
     }
 }
 
-fn unused_color(percent: u8) -> &'static str {
+fn unused_color(percent: u8) -> Color {
     if percent >= 90 {
-        "\x1b[38;2;252;165;165m"
+        Color::Red
     } else if percent >= 70 {
-        "\x1b[38;2;253;230;138m"
+        Color::Yellow
     } else {
-        "\x1b[38;2;134;239;172m"
+        Color::Green
     }
 }
 
@@ -977,12 +986,18 @@ mod tests {
     }
 
     #[test]
-    fn colored_usage_bar_distinguishes_used_and_available_quota() {
+    fn colored_usage_bar_uses_regular_and_bright_terminal_colors() {
         let bar = colored_usage_bar(50, 4, true);
         assert!(bar.contains("██"));
         assert!(bar.contains("░░"));
-        assert!(bar.contains(usage_color(50)));
-        assert!(bar.contains(unused_color(50)));
+        assert!(bar.contains(&SetForegroundColor(Color::DarkGreen).to_string()));
+        assert!(bar.contains(&SetForegroundColor(Color::Green).to_string()));
+        assert!(!bar.contains("\x1b[38;2;"));
+        assert_eq!(usage_color(70), Color::DarkYellow);
+        assert_eq!(unused_color(70), Color::Yellow);
+        assert_eq!(usage_color(90), Color::DarkRed);
+        assert_eq!(unused_color(90), Color::Red);
+        assert_ne!(Color::DarkGrey, unused_color(50));
         assert_ne!(bar, usage_bar(50, 4));
     }
 
@@ -1101,10 +1116,9 @@ mod tests {
                 usage_bar(0, BAR_WIDTH)
             )
         );
-        assert!(
-            render_dashboard(&snapshot, true, default_layout(false))
-                .contains("\x1b[38;2;156;163;175m")
-        );
+        let dashboard = render_dashboard(&snapshot, true, default_layout(false));
+        assert!(dashboard.contains(&SetForegroundColor(Color::DarkGrey).to_string()));
+        assert!(!dashboard.contains("\x1b[38;2;"));
     }
 
     #[test]
@@ -1320,7 +1334,7 @@ mod tests {
 
         assert!(
             render_dashboard(&snapshot, true, default_layout(true))
-                .contains("\x1b[38;2;156;163;175m")
+                .contains(&SetForegroundColor(Color::DarkGrey).to_string())
         );
     }
 }
