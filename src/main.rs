@@ -22,7 +22,7 @@ const BAR_WIDTH_COMPACT: usize = 16;
 const PROVIDER_WIDTH: usize = 11;
 const WINDOW_WIDTH: usize = 6;
 const RESET_WIDTH: usize = "unavailable".len();
-const COMPACT_THRESHOLD: u16 = 60;
+const COMPACT_THRESHOLD: u16 = 80;
 const CODEX_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
 const OPENCODE_GO_URL: &str = "https://opencode.ai";
 
@@ -145,12 +145,14 @@ fn main() {
 fn watch(args: &WatchArgs) -> i32 {
     let terminal = io::stdout().is_terminal();
     let colors = terminal && !args.display.no_color && env::var_os("NO_COLOR").is_none();
-    let compact = args.display.compact
-        || (terminal
-            && size()
-                .map(|(cols, _)| cols < COMPACT_THRESHOLD)
-                .unwrap_or(false));
     loop {
+        let compact = compact_layout(
+            args.display.compact,
+            terminal
+                .then(size)
+                .and_then(Result::ok)
+                .map(|(cols, _)| cols),
+        );
         let snapshot = fetch_snapshot(&args.display.query.providers);
         if terminal {
             print!("\x1b[2J\x1b[H");
@@ -219,12 +221,15 @@ fn is_exit_key(key: KeyEvent) -> bool {
 
 fn print_once(args: &DisplayArgs) -> i32 {
     let snapshot = fetch_snapshot(&args.query.providers);
-    let colors = io::stdout().is_terminal() && !args.no_color && env::var_os("NO_COLOR").is_none();
-    let compact = args.compact
-        || (io::stdout().is_terminal()
-            && size()
-                .map(|(cols, _)| cols < COMPACT_THRESHOLD)
-                .unwrap_or(false));
+    let terminal = io::stdout().is_terminal();
+    let colors = terminal && !args.no_color && env::var_os("NO_COLOR").is_none();
+    let compact = compact_layout(
+        args.compact,
+        terminal
+            .then(size)
+            .and_then(Result::ok)
+            .map(|(cols, _)| cols),
+    );
     println!("{}", render_dashboard(&snapshot, colors, compact));
     exit_code(&snapshot)
 }
@@ -236,6 +241,10 @@ fn print_json(args: &QueryArgs) -> i32 {
         serde_json::to_string_pretty(&snapshot).expect("snapshot serializes")
     );
     exit_code(&snapshot)
+}
+
+fn compact_layout(force: bool, columns: Option<u16>) -> bool {
+    force || columns.is_some_and(|columns| columns <= COMPACT_THRESHOLD)
 }
 
 fn exit_code(snapshot: &Snapshot) -> i32 {
@@ -812,6 +821,15 @@ fn home_dir() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compact_layout_uses_flag_or_narrow_terminal() {
+        assert!(compact_layout(true, None));
+        assert!(compact_layout(false, Some(COMPACT_THRESHOLD)));
+        assert!(compact_layout(false, Some(COMPACT_THRESHOLD - 1)));
+        assert!(!compact_layout(false, Some(COMPACT_THRESHOLD + 1)));
+        assert!(!compact_layout(false, None));
+    }
 
     #[test]
     fn exit_keys_are_limited_to_q_and_control_shortcuts() {
