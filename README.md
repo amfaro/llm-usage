@@ -1,6 +1,6 @@
 # llm-usage
 
-Standalone terminal dashboard for subscription quota windows. Supports Codex and OpenCode Go without importing Pi.
+Standalone terminal dashboard for subscription quota windows. Supports Codex, OpenCode Go, and Claude Code without importing Pi.
 
 ```sh
 cargo run -- watch                 # refresh every 30 seconds
@@ -10,7 +10,7 @@ cargo run -- once --provider codex
 cargo run -- watch --interval 60 --no-color
 ```
 
-`watch` is the default command. Press `q` to exit. Use `--provider codex` or `--provider opencode-go` repeatedly to filter providers.
+`watch` is the default command. Press `q` to exit. Use `--provider codex`, `--provider opencode-go`, or `--provider claude-code` repeatedly to filter providers.
 
 ## Credentials
 
@@ -27,6 +27,22 @@ Lookup order:
 5. `~/.codex/auth.json`
 
 The discovered credential must be an OAuth credential. Log in again with Codex or Pi when it expires. When the upstream response omits a window (currently the Codex 5h window), the dashboard retains a muted `unavailable` row; it returns automatically when supplied again.
+
+### Claude Code
+
+Claude Code authentication mirrors the Codex lookup order, but uses a Claude Code OAuth access token from `~/.claude/.credentials.json` (or macOS Keychain):
+
+1. `LLM_USAGE_CLAUDE_CODE_ACCESS_TOKEN`
+2. `LLM_USAGE_CLAUDE_CODE_AUTH_FILE`
+3. `~/.claude/.credentials.json`
+4. macOS Keychain entries whose service starts with
+   `Claude Code-credentials` (enumerated via `security`; the freshest
+   unexpired token wins).
+
+The token is sent as a `Bearer` token to Anthropic's internal OAuth usage endpoint. If the endpoint returns rate limits or rejects the token (for example, when using an `ANTHROPIC_API_KEY` instead of an OAuth session), the dashboard shows an `unavailable` row with a clear message.
+
+> [!NOTE]
+> The Claude Code usage endpoint is undocumented and may change or rate-limit aggressively. The dashboard degrades gracefully on any error.
 
 ### OpenCode Go
 
@@ -56,6 +72,17 @@ export OPENCODE_GO_AUTH_COOKIE='your-auth-cookie-value'
       "source": "oauth",
       "windows": [
         { "label": "5h", "used_percent": 42, "reset_at": 1783874800, "window_seconds": 18000 }
+      ],
+      "fetched_at": 1783871200
+    },
+    {
+      "provider": "claude-code",
+      "available": true,
+      "plan": "max_5x",
+      "source": "oauth",
+      "windows": [
+        { "label": "5h", "used_percent": 31.2, "reset_at": 1783874800, "window_seconds": 18000 },
+        { "label": "7d", "used_percent": 64.0, "reset_at": 1784393200, "window_seconds": 604800 }
       ],
       "fetched_at": 1783871200
     }
