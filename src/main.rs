@@ -544,7 +544,7 @@ fn codex_cli_credentials(data: &Value) -> Option<(String, Option<String>)> {
 }
 
 fn fetch_claude_code(client: &Client, fetched_at: u64) -> ProviderUsage {
-    let Some(access_token) = claude_code_credentials() else {
+    let Some((access_token, plan)) = claude_code_credentials() else {
         return unavailable(
             Provider::ClaudeCode,
             "Claude Code OAuth credential not found",
@@ -594,10 +594,11 @@ fn fetch_claude_code(client: &Client, fetched_at: u64) -> ProviderUsage {
     ProviderUsage {
         provider: Provider::ClaudeCode.name(),
         available: true,
-        plan: data
-            .get("plan")
-            .and_then(Value::as_str)
-            .map(ToOwned::to_owned),
+        plan: plan.or_else(|| {
+            data.get("plan")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned)
+        }),
         source: Some("oauth"),
         windows,
         error: None,
@@ -640,11 +641,11 @@ fn claude_code_window(
     })
 }
 
-fn claude_code_credentials() -> Option<String> {
+fn claude_code_credentials() -> Option<(String, Option<String>)> {
     if let Ok(access) = env::var("LLM_USAGE_CLAUDE_CODE_ACCESS_TOKEN")
         && !access.trim().is_empty()
     {
-        return Some(access);
+        return Some((access, None));
     }
     for path in claude_code_auth_paths() {
         let Ok(mut file) = File::open(path) else {
@@ -657,11 +658,77 @@ fn claude_code_credentials() -> Option<String> {
         let Ok(data) = serde_json::from_str::<Value>(&content) else {
             continue;
         };
-        if let Some(access) = claude_code_file_credentials(&data) {
-            return Some(access);
+        if let Some(creds) = claude_code_oauth_credentials(&data) {
+            return Some(creds);
         }
     }
+    if let Some(creds) = claude_code_keychain_credentials() {
+        return Some(creds);
+    }
     None
+}
+
+fn claude_code_keychain_credentials() -> Option<(String, Option<String>)> {
+    if cfg!(not(target_os = "macos")) {
+        return None;
+    }
+
+    // Claude Code may store one token per organization under services like
+    // `Claude Code-credentials-<org-hash>`, plus a legacy `Claude Code-credentials`
+    // entry. Enumerate every matching service via `security dump-keychain`, then
+    // return the freshest unexpired token.
+    let dump = std::process::Command::new("security")
+        .args(["dump-keychain"])
+        .output()
+        .ok()?;
+    let dump_str = String::from_utf8_lossy(&dump.stdout);
+    let services: Vec<String> = dump_str
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with("\"svce\"<blob>=\""))
+        .filter_map(|line| {
+            let after = line
+                .strip_prefix("\"svce\"<blob>=\"")
+                .and_then(|rest| rest.strip_suffix('"'))?;
+            after
+                .strip_prefix("Claude Code-credentials")
+                .map(|_| after.to_string())
+        })
+        .collect();
+    if services.is_empty() {
+        return None;
+    }
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| u64::try_from(d.as_millis()).unwrap_or(0))
+        .unwrap_or(0);
+    let mut best: Option<(u64, (String, Option<String>))> = None;
+    for service in &services {
+        let output = std::process::Command::new("security")
+            .args(["find-generic-password", "-s", service.as_str(), "-w"])
+            .output()
+            .ok()?;
+        // Skip prompts / failures rather than aborting enumeration.
+        if !output.status.success() {
+            continue;
+        }
+        let content = String::from_utf8_lossy(&output.stdout);
+        let Ok(data) = serde_json::from_str::<Value>(content.trim()) else {
+            continue;
+        };
+        let Some(creds) = claude_code_oauth_credentials(&data) else {
+            continue;
+        };
+        let expires_at = data
+            .get("claudeAiOauth")
+            .and_then(|o| o.get("expiresAt"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        if expires_at > now_ms && (best.is_none() || expires_at > best.as_ref().unwrap().0) {
+            best = Some((expires_at, creds));
+        }
+    }
+    best.map(|(_, creds)| creds)
 }
 
 fn claude_code_auth_paths() -> Vec<PathBuf> {
@@ -675,13 +742,17 @@ fn claude_code_auth_paths() -> Vec<PathBuf> {
     paths
 }
 
-fn claude_code_file_credentials(data: &Value) -> Option<String> {
+fn claude_code_oauth_credentials(data: &Value) -> Option<(String, Option<String>)> {
     let oauth = data.get("claudeAiOauth")?;
     let access = oauth.get("accessToken")?.as_str()?.trim();
     if access.is_empty() {
         return None;
     }
-    Some(access.to_owned())
+    let plan = oauth
+        .get("subscriptionType")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
+    Some((access.to_owned(), plan))
 }
 
 fn fetch_opencode_go(fetched_at: u64) -> ProviderUsage {

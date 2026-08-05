@@ -30,11 +30,14 @@ The discovered credential must be an OAuth credential. Log in again with Codex o
 
 ### Claude Code
 
-Claude Code authentication mirrors the Codex lookup order, but uses a Claude Code OAuth access token from `~/.claude/.credentials.json`:
+Claude Code authentication mirrors the Codex lookup order, but uses a Claude Code OAuth access token from `~/.claude/.credentials.json` (or macOS Keychain):
 
 1. `LLM_USAGE_CLAUDE_CODE_ACCESS_TOKEN`
 2. `LLM_USAGE_CLAUDE_CODE_AUTH_FILE`
 3. `~/.claude/.credentials.json`
+4. macOS Keychain entries whose service starts with
+   `Claude Code-credentials` (enumerated via `security`; the freshest
+   unexpired token wins).
 
 The token is sent as a `Bearer` token to Anthropic's internal OAuth usage endpoint. If the endpoint returns rate limits or rejects the token (for example, when using an `ANTHROPIC_API_KEY` instead of an OAuth session), the dashboard shows an `unavailable` row with a clear message.
 
