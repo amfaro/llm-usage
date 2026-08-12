@@ -14,8 +14,7 @@ use crossterm::{
     style::{Attribute, Color, ResetColor, SetAttribute, SetForegroundColor},
     terminal::{disable_raw_mode, enable_raw_mode, size},
 };
-use regex::Regex;
-use reqwest::{Url, blocking::Client, redirect::Policy};
+use reqwest::blocking::Client;
 use serde::Serialize;
 use serde_json::Value;
 
@@ -27,7 +26,7 @@ const COMPACT_WINDOW_WIDTH: usize = 3;
 const RESET_WIDTH: usize = "unavailable".len();
 const CODEX_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
 const CLAUDE_CODE_USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
-const OPENCODE_GO_URL: &str = "https://opencode.ai";
+const OPENCODE_GO_USAGE_URL: &str = "https://opencode.ai/zen/go/v1/usage";
 
 #[derive(Parser)]
 #[command(about = "Show subscription quotas for Codex, OpenCode Go, and Claude Code")]
@@ -309,7 +308,7 @@ fn fetch_snapshot(requested: &[Provider]) -> Snapshot {
             .into_iter()
             .map(|provider| match provider {
                 Provider::Codex => fetch_codex(&client, fetched_at),
-                Provider::OpencodeGo => fetch_opencode_go(fetched_at),
+                Provider::OpencodeGo => fetch_opencode_go(&client, fetched_at),
                 Provider::ClaudeCode => fetch_claude_code(&client, fetched_at),
             })
             .collect(),
@@ -755,71 +754,50 @@ fn claude_code_oauth_credentials(data: &Value) -> Option<(String, Option<String>
     Some((access.to_owned(), plan))
 }
 
-fn fetch_opencode_go(fetched_at: u64) -> ProviderUsage {
-    let (Some(workspace_id), Some(auth_cookie)) = (
-        nonempty_env("OPENCODE_GO_WORKSPACE_ID"),
-        nonempty_env("OPENCODE_GO_AUTH_COOKIE"),
-    ) else {
-        return unavailable(
-            Provider::OpencodeGo,
-            "set OPENCODE_GO_WORKSPACE_ID and OPENCODE_GO_AUTH_COOKIE",
-            fetched_at,
-        );
+fn fetch_opencode_go(client: &Client, fetched_at: u64) -> ProviderUsage {
+    let Some(api_key) = nonempty_env("OPENCODE_GO_API_KEY") else {
+        return unavailable(Provider::OpencodeGo, "set OPENCODE_GO_API_KEY", fetched_at);
     };
-    let mut url = Url::parse(OPENCODE_GO_URL).expect("constant URL parses");
-    url.path_segments_mut()
-        .expect("base URL supports paths")
-        .extend(["workspace", workspace_id.as_str(), "go"]);
-    let cookie = if auth_cookie.trim_start().starts_with("auth=") {
-        auth_cookie
-    } else {
-        format!("auth={auth_cookie}")
-    };
-    let Ok(client) = Client::builder()
-        .timeout(Duration::from_secs(15))
-        .redirect(Policy::none())
-        .user_agent(concat!("llm-usage/", env!("CARGO_PKG_VERSION")))
-        .build()
-    else {
-        return unavailable(
-            Provider::OpencodeGo,
-            "OpenCode HTTP client failed",
-            fetched_at,
-        );
-    };
-    let response = match client.get(url).header("Cookie", cookie).send() {
+    let response = match client
+        .get(OPENCODE_GO_USAGE_URL)
+        .bearer_auth(api_key)
+        .send()
+    {
         Ok(response) if response.status().is_success() => response,
-        Ok(response)
-            if response.status().is_redirection()
-                || response.status().as_u16() == 401
-                || response.status().as_u16() == 403 =>
-        {
+        Ok(response) if response.status().as_u16() == 401 => {
             return unavailable(
                 Provider::OpencodeGo,
-                "OpenCode dashboard authentication failed",
+                "OpenCode Go API authentication failed",
+                fetched_at,
+            );
+        }
+        Ok(response) if response.status().as_u16() == 403 => {
+            return unavailable(
+                Provider::OpencodeGo,
+                "OpenCode Go subscription required",
                 fetched_at,
             );
         }
         Ok(_) | Err(_) => {
             return unavailable(
                 Provider::OpencodeGo,
-                "OpenCode dashboard request failed",
+                "OpenCode Go API request failed",
                 fetched_at,
             );
         }
     };
-    let Ok(html) = response.text() else {
+    let Ok(data) = response.json::<Value>() else {
         return unavailable(
             Provider::OpencodeGo,
-            "OpenCode dashboard response was invalid",
+            "OpenCode Go API response was invalid",
             fetched_at,
         );
     };
-    let windows = opencode_windows(&html, fetched_at);
+    let windows = opencode_api_windows(&data);
     if windows.is_empty() {
         return unavailable(
             Provider::OpencodeGo,
-            "OpenCode dashboard usage was not found",
+            "OpenCode Go usage was not found",
             fetched_at,
         );
     }
@@ -827,7 +805,7 @@ fn fetch_opencode_go(fetched_at: u64) -> ProviderUsage {
         provider: Provider::OpencodeGo.name(),
         available: true,
         plan: Some("Go".to_owned()),
-        source: Some("dashboard"),
+        source: Some("api"),
         windows,
         error: None,
         fetched_at,
@@ -838,50 +816,37 @@ fn nonempty_env(name: &str) -> Option<String> {
     env::var(name).ok().filter(|value| !value.trim().is_empty())
 }
 
-fn opencode_windows(html: &str, fetched_at: u64) -> Vec<UsageWindow> {
+fn opencode_api_windows(data: &Value) -> Vec<UsageWindow> {
+    let usage = data.get("usage");
     [
-        (&["rolling5h", "rolling", "rollingUsage"][..], "5h", 18_000),
-        (&["weekly", "weeklyUsage"][..], "7d", 604_800),
-        (&["monthly", "monthlyUsage"][..], "30d", 2_592_000),
+        (usage.and_then(|u| u.get("rolling")), "5h", 18_000),
+        (usage.and_then(|u| u.get("weekly")), "7d", 604_800),
+        (usage.and_then(|u| u.get("monthly")), "30d", 2_592_000),
     ]
     .into_iter()
-    .filter_map(|(keys, label, seconds)| opencode_window(html, keys, label, seconds, fetched_at))
+    .filter_map(|(value, label, seconds)| opencode_api_window(value, label, seconds))
     .collect()
 }
 
-fn opencode_window(
-    html: &str,
-    keys: &[&str],
+fn opencode_api_window(
+    value: Option<&Value>,
     label: &'static str,
     seconds: u64,
-    fetched_at: u64,
 ) -> Option<UsageWindow> {
-    let key_pattern = keys.join("|");
-    let object = Regex::new(&format!(r#"(?s)["']?(?:{key_pattern})["']?\s*[:=]\s*(?:\$R\[\d+\]\s*=\s*)?\{{(?P<object>[^{{}}]*)\}}"#)).ok()?;
-    let percent = Regex::new(r#"(?i)["']?(?:usagePercent|usedPercent|percent)["']?\s*[:=]\s*["']?([0-9]+(?:\.[0-9]+)?)["']?"#).expect("constant regex parses");
-    let reset = Regex::new(r#"(?i)["']?(?:resetInSec|resetAfterSeconds|resetAfterSec)["']?\s*[:=]\s*["']?([0-9]+(?:\.[0-9]+)?)["']?"#).expect("constant regex parses");
-    object.captures_iter(html).find_map(|captures| {
-        let object = captures.name("object")?.as_str();
-        let used_percent = percent
-            .captures(object)?
-            .get(1)?
-            .as_str()
-            .parse::<f64>()
-            .ok()?
-            .clamp(0.0, 100.0);
-        let reset_in_seconds = reset
-            .captures(object)?
-            .get(1)?
-            .as_str()
-            .parse::<u64>()
-            .ok()?;
-        Some(UsageWindow {
-            label,
-            used_percent: Some(used_percent),
-            reset_at: Some(fetched_at.saturating_add(reset_in_seconds)),
-            window_seconds: Some(seconds),
-            limit_reached: None,
-        })
+    let value = value?;
+    let percent = value.get("percent").and_then(Value::as_f64)?;
+    let reset_iso = value.get("resetsAt").and_then(Value::as_str)?;
+    let reset_at = u64::try_from(DateTime::parse_from_rfc3339(reset_iso).ok()?.timestamp()).ok()?;
+    let limit_reached = value
+        .get("status")
+        .and_then(Value::as_str)
+        .map(|s| s == "rate-limited");
+    Some(UsageWindow {
+        label,
+        used_percent: Some(percent.clamp(0.0, 100.0)),
+        reset_at: Some(reset_at),
+        window_seconds: Some(seconds),
+        limit_reached,
     })
 }
 
@@ -1226,17 +1191,24 @@ mod tests {
     }
 
     #[test]
-    fn parses_opencode_dashboard_windows_in_either_field_order() {
-        let html = r#"
-            <script>let a={rolling5h:{usagePercent:50,resetInSec:7200}};</script>
-            <script>let b={weekly:{resetInSec:3600,usagePercent:25}};</script>
-        "#;
-        let windows = opencode_windows(html, 1_000);
+    fn parses_opencode_api_windows() {
+        let data = serde_json::json!({
+            "usage": {
+                "rolling": { "status": "ok", "percent": 50.0, "resetsAt": "2026-01-01T03:00:00Z" },
+                "weekly": { "status": "rate-limited", "percent": 75.0, "resetsAt": "2026-01-07T00:00:00Z" }
+            }
+        });
+        let windows = opencode_api_windows(&data);
         assert_eq!(windows.len(), 2);
         assert_eq!(windows[0].label, "5h");
-        assert_eq!(windows[0].reset_at, Some(8_200));
+        assert_eq!(windows[0].used_percent, Some(50.0));
+        assert!(windows[0].reset_at.unwrap() > 1_000);
+        assert_eq!(windows[0].window_seconds, Some(18_000));
+        assert_eq!(windows[0].limit_reached, Some(false));
         assert_eq!(windows[1].label, "7d");
-        assert_eq!(windows[1].used_percent, Some(25.0));
+        assert_eq!(windows[1].used_percent, Some(75.0));
+        assert_eq!(windows[1].limit_reached, Some(true));
+        assert_eq!(windows[1].window_seconds, Some(604_800));
     }
 
     #[test]
