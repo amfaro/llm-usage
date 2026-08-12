@@ -46,14 +46,11 @@ The token is sent as a `Bearer` token to Anthropic's internal OAuth usage endpoi
 
 ### OpenCode Go
 
-OpenCode does not currently provide a public Go plan quota API ([issue #16017](https://github.com/anomalyco/opencode/issues/16017)). The tool therefore reads the authenticated Go dashboard page. Set both values explicitly:
-
 ```sh
-export OPENCODE_GO_WORKSPACE_ID='your-workspace-id'
-export OPENCODE_GO_AUTH_COOKIE='your-auth-cookie-value'
+export OPENCODE_GO_API_KEY='your-opencode-go-api-key'
 ```
 
-`OPENCODE_GO_AUTH_COOKIE` may be either the cookie value or `auth=<value>`. The tool does not extract browser cookies.
+The API key is sent as a `Bearer` token to `GET https://opencode.ai/zen/go/v1/usage`.
 
 ## Exit status
 
