@@ -158,11 +158,11 @@ fn watch(args: &WatchArgs) -> i32 {
             args.display.compact,
             dimensions.map(|(columns, _)| columns),
         );
-        let dashboard = render_dashboard(&snapshot, colors, layout);
+        let dashboard = render_dashboard_with_hint(&snapshot, colors, layout, Some(args.interval));
         if terminal {
             print!("\x1b[2J\x1b[H");
         }
-        println!("{dashboard}\n\nrefresh: {}s · q to exit", args.interval);
+        println!("{dashboard}");
         let _ = io::stdout().flush();
         let raw_mode = io::stdin()
             .is_terminal()
@@ -864,11 +864,20 @@ fn dashboard_reset_width(snapshot: &Snapshot) -> usize {
         .fold(RESET_WIDTH, usize::max)
 }
 
-#[allow(clippy::too_many_lines)]
 fn render_dashboard(snapshot: &Snapshot, colors: bool, layout: DashboardLayout) -> String {
+    render_dashboard_with_hint(snapshot, colors, layout, None)
+}
+
+#[allow(clippy::too_many_lines)]
+fn render_dashboard_with_hint(
+    snapshot: &Snapshot,
+    colors: bool,
+    layout: DashboardLayout,
+    refresh_interval: Option<u64>,
+) -> String {
     let reset_width = dashboard_reset_width(snapshot);
     let DashboardLayout { compact, bar_width } = layout;
-    let mut lines = vec![dashboard_title(colors)];
+    let mut lines = vec![dashboard_title_with_hint(colors, refresh_interval)];
     let mut rendered_header = false;
     for (index, provider) in snapshot.providers.iter().enumerate() {
         if index > 0 {
@@ -953,19 +962,28 @@ fn render_dashboard(snapshot: &Snapshot, colors: bool, layout: DashboardLayout) 
     lines.join("\n")
 }
 
+#[allow(dead_code)]
 fn dashboard_title(colors: bool) -> String {
+    dashboard_title_with_hint(colors, None)
+}
+
+fn dashboard_title_with_hint(colors: bool, refresh_interval: Option<u64>) -> String {
     const TITLE: &str = " LLM USAGE";
     const SUBTITLE: &str = " · subscription quotas";
+    let refresh = refresh_interval.map_or(String::new(), |interval| {
+        format!(" · refresh: {interval}s · q to exit")
+    });
     if colors {
         format!(
-            "{}{}{TITLE}{}{}",
+            "{}{}{TITLE}{}{}{}",
             SetAttribute(Attribute::Bold),
             SetForegroundColor(Color::Blue),
             SetAttribute(Attribute::Reset),
-            muted_text(SUBTITLE)
+            muted_text(SUBTITLE),
+            muted_text(&refresh)
         )
     } else {
-        format!("{TITLE}{SUBTITLE}")
+        format!("{TITLE}{SUBTITLE}{refresh}")
     }
 }
 
