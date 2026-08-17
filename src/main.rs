@@ -158,7 +158,7 @@ fn watch(args: &WatchArgs) -> i32 {
         let snapshot = fetch_snapshot(&args.display.query.providers);
         let layout = dashboard_layout(&snapshot, args.display.compact, columns);
         let hint = refresh_hint(args.interval, args.interval, columns);
-        let dashboard = render_dashboard_with_hint(&snapshot, colors, layout, Some(&hint));
+        let dashboard = render_dashboard_with_hint(&snapshot, colors, layout, Some(&hint), columns);
         if terminal {
             print!("\x1b[2J\x1b[H");
         }
@@ -187,6 +187,7 @@ fn watch(args: &WatchArgs) -> i32 {
                         update_dashboard_title(
                             colors,
                             &refresh_hint(args.interval, remaining, columns),
+                            columns,
                         );
                     }
                     if remaining == 0 {
@@ -203,14 +204,14 @@ fn seconds_remaining(deadline: Instant) -> u64 {
     remaining.as_secs() + u64::from(remaining.subsec_nanos() != 0)
 }
 
-fn update_dashboard_title(colors: bool, hint: &str) {
+fn update_dashboard_title(colors: bool, hint: &str, columns: Option<u16>) {
     let mut stdout = io::stdout();
     let _ = execute!(
         stdout,
         SavePosition,
         MoveTo(0, 0),
         Clear(ClearType::CurrentLine),
-        Print(dashboard_title_with_hint(colors, Some(hint))),
+        Print(dashboard_title_with_hint(colors, Some(hint), columns)),
         RestorePosition
     );
 }
@@ -902,7 +903,7 @@ fn dashboard_reset_width(snapshot: &Snapshot) -> usize {
 }
 
 fn render_dashboard(snapshot: &Snapshot, colors: bool, layout: DashboardLayout) -> String {
-    render_dashboard_with_hint(snapshot, colors, layout, None)
+    render_dashboard_with_hint(snapshot, colors, layout, None, None)
 }
 
 #[allow(clippy::too_many_lines)]
@@ -911,10 +912,11 @@ fn render_dashboard_with_hint(
     colors: bool,
     layout: DashboardLayout,
     refresh_hint: Option<&str>,
+    columns: Option<u16>,
 ) -> String {
     let reset_width = dashboard_reset_width(snapshot);
     let DashboardLayout { compact, bar_width } = layout;
-    let mut lines = vec![dashboard_title_with_hint(colors, refresh_hint)];
+    let mut lines = vec![dashboard_title_with_hint(colors, refresh_hint, columns)];
     let mut rendered_header = false;
     for (index, provider) in snapshot.providers.iter().enumerate() {
         if index > 0 {
@@ -1001,24 +1003,58 @@ fn render_dashboard_with_hint(
 
 #[allow(dead_code)]
 fn dashboard_title(colors: bool) -> String {
-    dashboard_title_with_hint(colors, None)
+    dashboard_title_with_hint(colors, None, None)
 }
 
-fn dashboard_title_with_hint(colors: bool, refresh_hint: Option<&str>) -> String {
+fn dashboard_title_with_hint(
+    colors: bool,
+    refresh_hint: Option<&str>,
+    columns: Option<u16>,
+) -> String {
     const TITLE: &str = " LLM USAGE";
     const SUBTITLE: &str = " · subscription quotas";
     let refresh_hint = refresh_hint.unwrap_or_default();
+    let full_title = format!("{TITLE}{SUBTITLE}{refresh_hint}");
+    let max_width = columns.map(usize::from);
+    let subtitle = if max_width.is_none_or(|width| full_title.chars().count() <= width) {
+        SUBTITLE
+    } else {
+        ""
+    };
+    let concise_title = format!("{TITLE}{refresh_hint}");
+
+    if max_width.is_some_and(|width| concise_title.chars().count() > width) {
+        let compact = if refresh_hint.is_empty() {
+            TITLE.trim_start().to_owned()
+        } else {
+            format!(
+                "{} {}",
+                refresh_hint.trim_start_matches(" · "),
+                TITLE.trim_start()
+            )
+        };
+        let compact = compact
+            .chars()
+            .take(max_width.unwrap_or_default())
+            .collect::<String>();
+        return if colors {
+            muted_text(&compact)
+        } else {
+            compact
+        };
+    }
+
     if colors {
         format!(
             "{}{}{TITLE}{}{}{}",
             SetAttribute(Attribute::Bold),
             SetForegroundColor(Color::Blue),
             SetAttribute(Attribute::Reset),
-            muted_text(SUBTITLE),
+            muted_text(subtitle),
             muted_text(refresh_hint)
         )
     } else {
-        format!("{TITLE}{SUBTITLE}{refresh_hint}")
+        format!("{TITLE}{subtitle}{refresh_hint}")
     }
 }
 
@@ -1029,7 +1065,7 @@ fn refresh_hint(interval: u64, remaining: u64, columns: Option<u16>) -> String {
     let Some(columns) = columns else {
         return format!(" · refresh: {remaining}s · q to exit");
     };
-    let fixed_width = dashboard_title_with_hint(false, Some(FIXED_HINT))
+    let fixed_width = dashboard_title_with_hint(false, Some(FIXED_HINT), None)
         .chars()
         .count();
     let width = usize::from(columns)
@@ -1037,7 +1073,7 @@ fn refresh_hint(interval: u64, remaining: u64, columns: Option<u16>) -> String {
         .min(MAX_DOTS)
         .min(usize::try_from(interval).unwrap_or(MAX_DOTS));
     if width == 0 {
-        return format!(" · refresh: {remaining}s · q to exit");
+        return format!(" · {}", refresh_progress(interval, remaining));
     }
 
     let active = usize::try_from(
@@ -1050,6 +1086,16 @@ fn refresh_hint(interval: u64, remaining: u64, columns: Option<u16>) -> String {
         ".".repeat(active),
         " ".repeat(width - active)
     )
+}
+
+fn refresh_progress(interval: u64, remaining: u64) -> char {
+    const FRAMES: [char; 9] = ['⠀', '⠁', '⠃', '⠇', '⠏', '⠟', '⠿', '⡿', '⣿'];
+
+    let interval = interval.max(1);
+    let level =
+        usize::try_from((u128::from(remaining.min(interval)) * 8).div_ceil(u128::from(interval)))
+            .unwrap_or_default();
+    FRAMES[level]
 }
 
 fn colored_usage_bar(percent: u8, width: usize, colors: bool) -> String {
@@ -1260,7 +1306,7 @@ mod tests {
     }
 
     #[test]
-    fn refresh_hint_scales_and_falls_back_to_seconds() {
+    fn refresh_hint_scales_and_uses_determinate_progress_when_narrow() {
         assert_eq!(
             refresh_hint(60, 30, Some(100))
                 .chars()
@@ -1269,7 +1315,23 @@ mod tests {
             15
         );
         assert_eq!(refresh_hint(30, 12, None), " · refresh: 12s · q to exit");
-        assert_eq!(refresh_hint(30, 12, Some(1)), " · refresh: 12s · q to exit");
+        assert_eq!(refresh_hint(30, 12, Some(1)), " · ⠏");
+        assert_eq!(refresh_progress(30, 30), '⣿');
+        assert_eq!(refresh_progress(30, 15), '⠏');
+        assert_eq!(refresh_progress(30, 0), '⠀');
+    }
+
+    #[test]
+    fn narrow_title_keeps_indicator_visible_without_overflow() {
+        let hint = refresh_hint(30, 12, Some(28));
+        let title = dashboard_title_with_hint(false, Some(&hint), Some(28));
+        let tiny_title = dashboard_title_with_hint(false, Some(&hint), Some(5));
+
+        assert!(title.contains('⠏'));
+        assert!(title.chars().count() <= 28);
+        assert!(!title.contains("subscription quotas"));
+        assert!(tiny_title.starts_with('⠏'));
+        assert!(tiny_title.chars().count() <= 5);
     }
 
     #[test]
