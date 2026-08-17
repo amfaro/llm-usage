@@ -10,11 +10,16 @@ use std::{
 use chrono::{DateTime, Utc};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use crossterm::{
-    cursor::{MoveTo, RestorePosition, SavePosition},
     event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
-    execute,
-    style::{Attribute, Color, Print, ResetColor, SetAttribute, SetForegroundColor},
-    terminal::{Clear, ClearType, disable_raw_mode, enable_raw_mode, size},
+    style::{Attribute, Color, ResetColor, SetAttribute, SetForegroundColor},
+    terminal::{disable_raw_mode, enable_raw_mode, size},
+};
+use ratatui::{
+    Frame,
+    layout::{Alignment, Constraint, Layout, Rect},
+    style::{Color as TuiColor, Modifier, Style},
+    text::{Line, Span},
+    widgets::{Gauge, LineGauge, Paragraph},
 };
 use reqwest::blocking::Client;
 use serde::Serialize;
@@ -26,6 +31,7 @@ const PROVIDER_WIDTH: usize = 11;
 const WINDOW_WIDTH: usize = 6;
 const COMPACT_WINDOW_WIDTH: usize = 3;
 const RESET_WIDTH: usize = "unavailable".len();
+const TUI_TICK_RATE: Duration = Duration::from_millis(100);
 const CODEX_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
 const CLAUDE_CODE_USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
 const OPENCODE_GO_USAGE_URL: &str = "https://opencode.ai/zen/go/v1/usage";
@@ -150,70 +156,366 @@ fn main() {
 }
 
 fn watch(args: &WatchArgs) -> i32 {
-    let terminal = io::stdout().is_terminal();
-    let colors = terminal && !args.display.no_color && env::var_os("NO_COLOR").is_none();
-    loop {
-        let dimensions = terminal.then(size).and_then(Result::ok);
-        let columns = dimensions.map(|(columns, _)| columns);
-        let snapshot = fetch_snapshot(&args.display.query.providers);
-        let layout = dashboard_layout(&snapshot, args.display.compact, columns);
-        let hint = refresh_hint(args.interval, args.interval, columns);
-        let dashboard = render_dashboard_with_hint(&snapshot, colors, layout, Some(&hint), columns);
-        if terminal {
-            print!("\x1b[2J\x1b[H");
+    if !io::stdout().is_terminal() {
+        return watch_plain(args);
+    }
+
+    let colors = !args.display.no_color && env::var_os("NO_COLOR").is_none();
+    match ratatui::run(|terminal| watch_tui(terminal, args, colors)) {
+        Ok(()) => 0,
+        Err(error) => {
+            eprintln!("watch failed: {error}");
+            1
         }
-        println!("{dashboard}");
+    }
+}
+
+fn watch_tui(
+    terminal: &mut ratatui::DefaultTerminal,
+    args: &WatchArgs,
+    colors: bool,
+) -> io::Result<()> {
+    let interval = Duration::from_secs(args.interval);
+    let mut snapshot = fetch_snapshot(&args.display.query.providers);
+    let mut deadline = Instant::now() + interval;
+
+    loop {
+        if Instant::now() >= deadline {
+            snapshot = fetch_snapshot(&args.display.query.providers);
+            deadline = Instant::now() + interval;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        terminal.draw(|frame| {
+            render_watch_dashboard(
+                frame,
+                &snapshot,
+                args.display.compact,
+                colors,
+                interval,
+                remaining,
+            );
+        })?;
+
+        match wait_for_action(remaining.min(TUI_TICK_RATE), true)? {
+            WaitAction::Exit => return Ok(()),
+            WaitAction::Resize | WaitAction::Timeout => {}
+        }
+    }
+}
+
+fn watch_plain(args: &WatchArgs) -> i32 {
+    let raw_mode = io::stdin()
+        .is_terminal()
+        .then(RawMode::enable)
+        .transpose()
+        .ok()
+        .flatten();
+    loop {
+        let snapshot = fetch_snapshot(&args.display.query.providers);
+        let layout = dashboard_layout(&snapshot, args.display.compact, None);
+        println!("{}", render_dashboard(&snapshot, false, layout));
         let _ = io::stdout().flush();
-        let raw_mode = io::stdin()
-            .is_terminal()
-            .then(RawMode::enable)
-            .transpose()
-            .ok()
-            .flatten();
-        let deadline = Instant::now() + Duration::from_secs(args.interval);
-        loop {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            let timeout = if terminal {
-                remaining.min(Duration::from_secs(1))
-            } else {
-                remaining
-            };
-            match wait_for_action(timeout, raw_mode.is_some()) {
-                WaitAction::Exit => return 0,
-                WaitAction::Resize => break,
-                WaitAction::Timeout => {
-                    let remaining = seconds_remaining(deadline);
-                    if terminal {
-                        update_dashboard_title(
-                            colors,
-                            &refresh_hint(args.interval, remaining, columns),
-                            columns,
-                        );
-                    }
-                    if remaining == 0 {
-                        break;
-                    }
-                }
+        match wait_for_action(Duration::from_secs(args.interval), raw_mode.is_some()) {
+            Ok(WaitAction::Exit) => return 0,
+            Ok(WaitAction::Resize | WaitAction::Timeout) => {}
+            Err(error) => {
+                eprintln!("watch failed: {error}");
+                return 1;
             }
         }
     }
 }
 
-fn seconds_remaining(deadline: Instant) -> u64 {
-    let remaining = deadline.saturating_duration_since(Instant::now());
-    remaining.as_secs() + u64::from(remaining.subsec_nanos() != 0)
+fn render_watch_dashboard(
+    frame: &mut Frame,
+    snapshot: &Snapshot,
+    force_compact: bool,
+    colors: bool,
+    interval: Duration,
+    remaining: Duration,
+) {
+    let area = frame.area();
+    let top = Rect::new(area.x, area.y, area.width, area.height.min(2));
+    let [top_content, refresh_area] =
+        Layout::horizontal([Constraint::Min(0), Constraint::Length(4)]).areas(top);
+    let compact = dashboard_layout(snapshot, force_compact, Some(top_content.width)).compact
+        || top_content.width < 56 + tui_reset_width(snapshot, top_content.width);
+    let mut y = top_content.y;
+
+    let Some(title_area) = next_tui_row(top_content, &mut y) else {
+        return;
+    };
+    let title = if top_content.width < 55 {
+        " LLM USAGE"
+    } else {
+        " LLM USAGE · subscription quotas"
+    };
+    let hint = if top_content.width < 55 {
+        " · q"
+    } else {
+        " · next refresh · q to exit"
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(title, tui_bold_style(colors, TuiColor::Blue)),
+            Span::styled(hint, tui_style(colors, TuiColor::DarkGray)),
+        ])),
+        title_area,
+    );
+
+    if !compact {
+        let Some(header_area) = next_tui_row(top_content, &mut y) else {
+            return;
+        };
+        let [provider, meter, usage, percent, reset] = tui_full_columns(header_area, snapshot);
+        let style = tui_bold_style(colors, TuiColor::DarkGray);
+        frame.render_widget(Paragraph::new("provider").style(style), provider);
+        frame.render_widget(Paragraph::new("meter").style(style), meter);
+        frame.render_widget(Paragraph::new("usage").style(style), usage);
+        frame.render_widget(
+            Paragraph::new("used")
+                .alignment(Alignment::Right)
+                .style(style),
+            percent,
+        );
+        frame.render_widget(
+            Paragraph::new("resets in")
+                .alignment(Alignment::Right)
+                .style(style),
+            reset,
+        );
+    }
+
+    render_tui_refresh_progress(frame, refresh_area, remaining, interval, colors);
+    let mut y = top.y.saturating_add(top.height);
+    for (index, provider) in snapshot.providers.iter().enumerate() {
+        if index > 0 {
+            render_tui_divider(frame, area, &mut y, colors);
+        }
+        render_tui_provider(frame, area, &mut y, provider, snapshot, compact, colors);
+    }
 }
 
-fn update_dashboard_title(colors: bool, hint: &str, columns: Option<u16>) {
-    let mut stdout = io::stdout();
-    let _ = execute!(
-        stdout,
-        SavePosition,
-        MoveTo(0, 0),
-        Clear(ClearType::CurrentLine),
-        Print(dashboard_title_with_hint(colors, Some(hint), columns)),
-        RestorePosition
+fn refresh_ratio(remaining: Duration, interval: Duration) -> f64 {
+    if interval.is_zero() {
+        0.0
+    } else {
+        (remaining.as_secs_f64() / interval.as_secs_f64()).clamp(0.0, 1.0)
+    }
+}
+
+fn render_tui_refresh_progress(
+    frame: &mut Frame,
+    area: Rect,
+    remaining: Duration,
+    interval: Duration,
+    colors: bool,
+) {
+    if area.width < 4 || area.height < 1 {
+        return;
+    }
+    let ratio = refresh_ratio(remaining, interval);
+    let seconds = remaining.as_secs() + u64::from(remaining.subsec_nanos() != 0);
+    frame.render_widget(
+        Gauge::default()
+            .use_unicode(true)
+            .ratio(ratio)
+            .label(format!("{seconds}s"))
+            .gauge_style(tui_style(colors, TuiColor::Blue)),
+        area,
     );
+}
+
+fn render_tui_divider(frame: &mut Frame, area: Rect, y: &mut u16, colors: bool) {
+    let Some(row) = next_tui_row(area, y) else {
+        return;
+    };
+    frame.render_widget(
+        Paragraph::new("─".repeat(usize::from(row.width)))
+            .style(tui_style(colors, TuiColor::DarkGray)),
+        row,
+    );
+}
+
+fn render_tui_provider(
+    frame: &mut Frame,
+    area: Rect,
+    y: &mut u16,
+    provider: &ProviderUsage,
+    snapshot: &Snapshot,
+    compact: bool,
+    colors: bool,
+) {
+    let provider_name = provider_label(provider.provider);
+    if !provider.available {
+        let Some(row) = next_tui_row(area, y) else {
+            return;
+        };
+        let [name, status] =
+            Layout::horizontal([Constraint::Percentage(40), Constraint::Percentage(60)]).areas(row);
+        frame.render_widget(
+            Paragraph::new(provider_name).style(tui_bold_style(colors, TuiColor::Reset)),
+            name,
+        );
+        frame.render_widget(
+            Paragraph::new(format!(
+                "unavailable: {}",
+                provider.error.unwrap_or("usage unavailable")
+            ))
+            .alignment(Alignment::Right)
+            .style(tui_style(colors, TuiColor::Red)),
+            status,
+        );
+        return;
+    }
+
+    if compact {
+        let Some(row) = next_tui_row(area, y) else {
+            return;
+        };
+        frame.render_widget(
+            Paragraph::new(provider_name).style(tui_bold_style(colors, TuiColor::Reset)),
+            row,
+        );
+    }
+
+    for (index, window) in provider.windows.iter().enumerate() {
+        let Some(row) = next_tui_row(area, y) else {
+            return;
+        };
+        if compact {
+            let [meter, usage, percent, reset] = tui_compact_columns(row, snapshot);
+            frame.render_widget(Paragraph::new(window.label), meter);
+            render_tui_usage(frame, usage, window, colors);
+            render_tui_percent(frame, percent, window, colors);
+            frame.render_widget(
+                Paragraph::new(reset_text(window.reset_at, snapshot.fetched_at))
+                    .alignment(Alignment::Right)
+                    .style(tui_style(colors, TuiColor::DarkGray)),
+                reset,
+            );
+        } else {
+            let [provider_area, meter, usage, percent, reset] = tui_full_columns(row, snapshot);
+            if index == 0 {
+                frame.render_widget(Paragraph::new(provider_name), provider_area);
+            }
+            frame.render_widget(Paragraph::new(window.label), meter);
+            render_tui_usage(frame, usage, window, colors);
+            render_tui_percent(frame, percent, window, colors);
+            frame.render_widget(
+                Paragraph::new(reset_text(window.reset_at, snapshot.fetched_at))
+                    .alignment(Alignment::Right)
+                    .style(tui_style(colors, TuiColor::DarkGray)),
+                reset,
+            );
+        }
+    }
+}
+
+fn render_tui_usage(frame: &mut Frame, area: Rect, window: &UsageWindow, colors: bool) {
+    let percent = window.used_percent.unwrap_or(0.0).clamp(0.0, 100.0);
+    frame.render_widget(
+        LineGauge::default()
+            .label("")
+            .ratio(percent / 100.0)
+            .filled_symbol("█")
+            .unfilled_symbol("░")
+            .filled_style(tui_usage_style(colors, percent))
+            .unfilled_style(tui_style(colors, TuiColor::DarkGray)),
+        area,
+    );
+}
+
+fn render_tui_percent(frame: &mut Frame, area: Rect, window: &UsageWindow, colors: bool) {
+    let (label, style) = match window.used_percent {
+        Some(percent) => (format!("{percent:.1}%"), tui_usage_style(colors, percent)),
+        None => (
+            "unavailable".to_owned(),
+            tui_style(colors, TuiColor::DarkGray),
+        ),
+    };
+    frame.render_widget(
+        Paragraph::new(label)
+            .alignment(Alignment::Right)
+            .style(style),
+        area,
+    );
+}
+
+fn tui_full_columns(area: Rect, snapshot: &Snapshot) -> [Rect; 5] {
+    Layout::horizontal([
+        Constraint::Length(13),
+        Constraint::Length(7),
+        Constraint::Length(28),
+        Constraint::Length(7),
+        Constraint::Length(tui_reset_width(snapshot, area.width).saturating_add(1)),
+    ])
+    .areas(area)
+}
+
+fn tui_compact_columns(area: Rect, snapshot: &Snapshot) -> [Rect; 4] {
+    Layout::horizontal([
+        Constraint::Length(5),
+        Constraint::Length(16),
+        Constraint::Length(7),
+        Constraint::Length(tui_reset_width(snapshot, area.width).saturating_add(1)),
+    ])
+    .areas(area)
+}
+
+fn tui_reset_width(snapshot: &Snapshot, width: u16) -> u16 {
+    if width < 40 {
+        return 0;
+    }
+    u16::try_from(dashboard_reset_width(snapshot))
+        .unwrap_or(u16::MAX)
+        .min(20)
+}
+
+fn next_tui_row(area: Rect, y: &mut u16) -> Option<Rect> {
+    if *y >= area.y.saturating_add(area.height) {
+        return None;
+    }
+    let row = Rect::new(area.x, *y, area.width, 1);
+    *y = y.saturating_add(1);
+    Some(row)
+}
+
+fn provider_label(provider: &str) -> &str {
+    match provider {
+        "codex" => "Codex",
+        "opencode-go" => "OpenCode Go",
+        "claude-code" => "Claude Code",
+        other => other,
+    }
+}
+
+fn tui_style(colors: bool, color: TuiColor) -> Style {
+    if colors {
+        Style::default().fg(color)
+    } else {
+        Style::default()
+    }
+}
+
+fn tui_bold_style(colors: bool, color: TuiColor) -> Style {
+    let style = tui_style(colors, color);
+    if colors {
+        style.add_modifier(Modifier::BOLD)
+    } else {
+        style
+    }
+}
+
+fn tui_usage_style(colors: bool, percent: f64) -> Style {
+    let color = if percent < 70.0 {
+        TuiColor::Green
+    } else if percent < 90.0 {
+        TuiColor::Yellow
+    } else {
+        TuiColor::Red
+    };
+    tui_style(colors, color)
 }
 
 struct RawMode;
@@ -237,24 +539,26 @@ enum WaitAction {
     Timeout,
 }
 
-fn wait_for_action(timeout: Duration, read_keys: bool) -> WaitAction {
+fn wait_for_action(timeout: Duration, read_keys: bool) -> io::Result<WaitAction> {
     if !read_keys {
         thread::sleep(timeout);
-        return WaitAction::Timeout;
+        return Ok(WaitAction::Timeout);
     }
 
     let deadline = Instant::now() + timeout;
     loop {
         let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
-            return WaitAction::Timeout;
+            return Ok(WaitAction::Timeout);
         };
-        if !event::poll(remaining).unwrap_or(false) {
-            return WaitAction::Timeout;
+        if !event::poll(remaining)? {
+            return Ok(WaitAction::Timeout);
         }
-        match event::read() {
-            Ok(Event::Key(key)) if is_exit_key(key) => return WaitAction::Exit,
-            Ok(event) if is_resize_event(&event) => return WaitAction::Resize,
-            _ => {}
+        let event = event::read()?;
+        if matches!(event, Event::Key(key) if is_exit_key(key)) {
+            return Ok(WaitAction::Exit);
+        }
+        if matches!(event, Event::Resize(_, _)) {
+            return Ok(WaitAction::Resize);
         }
     }
 }
@@ -266,10 +570,6 @@ fn is_exit_key(key: KeyEvent) -> bool {
             (KeyCode::Char('q'), KeyModifiers::NONE)
                 | (KeyCode::Char('c' | 'd'), KeyModifiers::CONTROL)
         )
-}
-
-fn is_resize_event(event: &Event) -> bool {
-    matches!(event, Event::Resize(_, _))
 }
 
 fn print_once(args: &DisplayArgs) -> i32 {
@@ -902,21 +1202,11 @@ fn dashboard_reset_width(snapshot: &Snapshot) -> usize {
         .fold(RESET_WIDTH, usize::max)
 }
 
-fn render_dashboard(snapshot: &Snapshot, colors: bool, layout: DashboardLayout) -> String {
-    render_dashboard_with_hint(snapshot, colors, layout, None, None)
-}
-
 #[allow(clippy::too_many_lines)]
-fn render_dashboard_with_hint(
-    snapshot: &Snapshot,
-    colors: bool,
-    layout: DashboardLayout,
-    refresh_hint: Option<&str>,
-    columns: Option<u16>,
-) -> String {
+fn render_dashboard(snapshot: &Snapshot, colors: bool, layout: DashboardLayout) -> String {
     let reset_width = dashboard_reset_width(snapshot);
     let DashboardLayout { compact, bar_width } = layout;
-    let mut lines = vec![dashboard_title_with_hint(colors, refresh_hint, columns)];
+    let mut lines = vec![dashboard_title(colors)];
     let mut rendered_header = false;
     for (index, provider) in snapshot.providers.iter().enumerate() {
         if index > 0 {
@@ -1001,101 +1291,20 @@ fn render_dashboard_with_hint(
     lines.join("\n")
 }
 
-#[allow(dead_code)]
 fn dashboard_title(colors: bool) -> String {
-    dashboard_title_with_hint(colors, None, None)
-}
-
-fn dashboard_title_with_hint(
-    colors: bool,
-    refresh_hint: Option<&str>,
-    columns: Option<u16>,
-) -> String {
-    const TITLE: &str = " LLM USAGE";
-    const SUBTITLE: &str = " · subscription quotas";
-    let refresh_hint = refresh_hint.unwrap_or_default();
-    let full_title = format!("{TITLE}{SUBTITLE}{refresh_hint}");
-    let max_width = columns.map(usize::from);
-    let subtitle = if max_width.is_none_or(|width| full_title.chars().count() <= width) {
-        SUBTITLE
-    } else {
-        ""
-    };
-    let concise_title = format!("{TITLE}{refresh_hint}");
-
-    if max_width.is_some_and(|width| concise_title.chars().count() > width) {
-        let compact = if refresh_hint.is_empty() {
-            TITLE.trim_start().to_owned()
-        } else {
-            format!(
-                "{} {}",
-                refresh_hint.trim_start_matches(" · "),
-                TITLE.trim_start()
-            )
-        };
-        let compact = compact
-            .chars()
-            .take(max_width.unwrap_or_default())
-            .collect::<String>();
-        return if colors {
-            muted_text(&compact)
-        } else {
-            compact
-        };
-    }
-
+    let title = " LLM USAGE";
+    let subtitle = " · subscription quotas";
     if colors {
         format!(
-            "{}{}{TITLE}{}{}{}",
+            "{}{}{title}{}{}",
             SetAttribute(Attribute::Bold),
             SetForegroundColor(Color::Blue),
             SetAttribute(Attribute::Reset),
-            muted_text(subtitle),
-            muted_text(refresh_hint)
+            muted_text(subtitle)
         )
     } else {
-        format!("{TITLE}{subtitle}{refresh_hint}")
+        format!("{title}{subtitle}")
     }
-}
-
-fn refresh_hint(interval: u64, remaining: u64, columns: Option<u16>) -> String {
-    const MAX_DOTS: usize = 30;
-    const FIXED_HINT: &str = " · refresh: [] · q to exit";
-
-    let Some(columns) = columns else {
-        return format!(" · refresh: {remaining}s · q to exit");
-    };
-    let fixed_width = dashboard_title_with_hint(false, Some(FIXED_HINT), None)
-        .chars()
-        .count();
-    let width = usize::from(columns)
-        .saturating_sub(fixed_width)
-        .min(MAX_DOTS)
-        .min(usize::try_from(interval).unwrap_or(MAX_DOTS));
-    if width == 0 {
-        return format!(" · {}", refresh_progress(interval, remaining));
-    }
-
-    let active = usize::try_from(
-        (u128::from(remaining.min(interval)) * u128::try_from(width).unwrap_or_default())
-            .div_ceil(u128::from(interval)),
-    )
-    .unwrap_or(width);
-    format!(
-        " · refresh: [{}{}] · q to exit",
-        ".".repeat(active),
-        " ".repeat(width - active)
-    )
-}
-
-fn refresh_progress(interval: u64, remaining: u64) -> char {
-    const FRAMES: [char; 9] = ['⠀', '⠁', '⠃', '⠇', '⠏', '⠟', '⠿', '⡿', '⣿'];
-
-    let interval = interval.max(1);
-    let level =
-        usize::try_from((u128::from(remaining.min(interval)) * 8).div_ceil(u128::from(interval)))
-            .unwrap_or_default();
-    FRAMES[level]
 }
 
 fn colored_usage_bar(percent: u8, width: usize, colors: bool) -> String {
@@ -1283,55 +1492,141 @@ mod tests {
     }
 
     #[test]
-    fn resize_events_trigger_refresh() {
-        assert!(is_resize_event(&Event::Resize(80, 24)));
-        assert!(!is_resize_event(&Event::Key(KeyEvent::new(
-            KeyCode::Char('q'),
-            KeyModifiers::NONE,
-        ))));
+    fn ratatui_compact_dashboard_renders_contrasting_bars() {
+        let snapshot = Snapshot {
+            fetched_at: 100,
+            providers: vec![ProviderUsage {
+                provider: "codex",
+                available: true,
+                plan: None,
+                source: None,
+                windows: vec![UsageWindow {
+                    label: "5h",
+                    used_percent: Some(50.0),
+                    reset_at: Some(200),
+                    window_seconds: Some(300),
+                    limit_reached: Some(false),
+                }],
+                error: None,
+                fetched_at: 100,
+            }],
+        };
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(32, 8))
+            .expect("test terminal");
+
+        terminal
+            .draw(|frame| {
+                render_watch_dashboard(
+                    frame,
+                    &snapshot,
+                    true,
+                    false,
+                    Duration::from_secs(30),
+                    Duration::from_secs(15),
+                );
+            })
+            .expect("dashboard render");
+        let content = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+
+        assert!(content.contains("LLM USAGE"));
+        let refresh = terminal
+            .backend()
+            .buffer()
+            .content()
+            .chunks(32)
+            .take(2)
+            .flat_map(|row| row[28..].iter())
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+
+        assert!(content.contains("LLM USAGE · q"));
+        assert_ne!(refresh, "        ");
+        assert!(content.contains("Codex"));
+        assert!(content.contains("████"));
+        assert!(content.contains("░░░░"));
+        assert!(content.contains("50.0%"));
     }
 
     #[test]
-    fn refresh_hint_counts_down_from_right_to_left() {
-        let full = refresh_hint(30, 30, Some(100));
-        let half = refresh_hint(30, 15, Some(100));
-        let empty = refresh_hint(30, 0, Some(100));
-        let dot_count = |hint: &str| hint.chars().filter(|character| *character == '.').count();
+    fn ratatui_dashboard_divides_providers_and_right_aligns_unavailable() {
+        let snapshot = Snapshot {
+            fetched_at: 100,
+            providers: vec![
+                ProviderUsage {
+                    provider: "codex",
+                    available: true,
+                    plan: None,
+                    source: None,
+                    windows: vec![UsageWindow {
+                        label: "5h",
+                        used_percent: Some(50.0),
+                        reset_at: Some(200),
+                        window_seconds: Some(300),
+                        limit_reached: Some(false),
+                    }],
+                    error: None,
+                    fetched_at: 100,
+                },
+                ProviderUsage {
+                    provider: "opencode-go",
+                    available: false,
+                    plan: None,
+                    source: None,
+                    windows: vec![],
+                    error: Some("usage unavailable"),
+                    fetched_at: 100,
+                },
+            ],
+        };
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 8))
+            .expect("test terminal");
 
-        assert_eq!(dot_count(&full), 30);
-        assert_eq!(dot_count(&half), 15);
-        assert_eq!(dot_count(&empty), 0);
-        assert_eq!(full.chars().count(), half.chars().count());
-        assert_eq!(half.chars().count(), empty.chars().count());
+        terminal
+            .draw(|frame| {
+                render_watch_dashboard(
+                    frame,
+                    &snapshot,
+                    false,
+                    false,
+                    Duration::from_secs(30),
+                    Duration::from_secs(15),
+                );
+            })
+            .expect("dashboard render");
+        let rows = terminal
+            .backend()
+            .buffer()
+            .content()
+            .chunks(80)
+            .map(|row| {
+                row.iter()
+                    .map(ratatui::buffer::Cell::symbol)
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+
+        assert!(rows[3].starts_with("────"));
+        assert!(rows[4].starts_with("OpenCode Go"));
+        assert!(rows[4].ends_with("unavailable: usage unavailable"));
     }
 
     #[test]
-    fn refresh_hint_scales_and_uses_determinate_progress_when_narrow() {
+    fn refresh_ratio_tracks_remaining_interval() {
         assert_eq!(
-            refresh_hint(60, 30, Some(100))
-                .chars()
-                .filter(|character| *character == '.')
-                .count(),
-            15
+            refresh_ratio(Duration::from_secs(30), Duration::from_secs(30)),
+            1.0
         );
-        assert_eq!(refresh_hint(30, 12, None), " · refresh: 12s · q to exit");
-        assert_eq!(refresh_hint(30, 12, Some(1)), " · ⠏");
-        assert_eq!(refresh_progress(30, 30), '⣿');
-        assert_eq!(refresh_progress(30, 15), '⠏');
-        assert_eq!(refresh_progress(30, 0), '⠀');
-    }
-
-    #[test]
-    fn narrow_title_keeps_indicator_visible_without_overflow() {
-        let hint = refresh_hint(30, 12, Some(28));
-        let title = dashboard_title_with_hint(false, Some(&hint), Some(28));
-        let tiny_title = dashboard_title_with_hint(false, Some(&hint), Some(5));
-
-        assert!(title.contains('⠏'));
-        assert!(title.chars().count() <= 28);
-        assert!(!title.contains("subscription quotas"));
-        assert!(tiny_title.starts_with('⠏'));
-        assert!(tiny_title.chars().count() <= 5);
+        assert_eq!(
+            refresh_ratio(Duration::from_secs(15), Duration::from_secs(30)),
+            0.5
+        );
+        assert_eq!(refresh_ratio(Duration::ZERO, Duration::from_secs(30)), 0.0);
     }
 
     #[test]
@@ -1353,6 +1648,9 @@ mod tests {
         assert_eq!(unused_color(70), Color::Yellow);
         assert_eq!(usage_color(90), Color::DarkRed);
         assert_eq!(unused_color(90), Color::Red);
+        assert_eq!(tui_usage_style(true, 69.9).fg, Some(TuiColor::Green));
+        assert_eq!(tui_usage_style(true, 70.0).fg, Some(TuiColor::Yellow));
+        assert_eq!(tui_usage_style(true, 90.0).fg, Some(TuiColor::Red));
         assert_ne!(Color::DarkGrey, unused_color(50));
         assert_ne!(bar, usage_bar(50, 4));
     }
