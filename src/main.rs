@@ -10,9 +10,11 @@ use std::{
 use chrono::{DateTime, Utc};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use crossterm::{
+    cursor::{MoveTo, RestorePosition, SavePosition},
     event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
-    style::{Attribute, Color, ResetColor, SetAttribute, SetForegroundColor},
-    terminal::{disable_raw_mode, enable_raw_mode, size},
+    execute,
+    style::{Attribute, Color, Print, ResetColor, SetAttribute, SetForegroundColor},
+    terminal::{Clear, ClearType, disable_raw_mode, enable_raw_mode, size},
 };
 use reqwest::blocking::Client;
 use serde::Serialize;
@@ -152,13 +154,11 @@ fn watch(args: &WatchArgs) -> i32 {
     let colors = terminal && !args.display.no_color && env::var_os("NO_COLOR").is_none();
     loop {
         let dimensions = terminal.then(size).and_then(Result::ok);
+        let columns = dimensions.map(|(columns, _)| columns);
         let snapshot = fetch_snapshot(&args.display.query.providers);
-        let layout = dashboard_layout(
-            &snapshot,
-            args.display.compact,
-            dimensions.map(|(columns, _)| columns),
-        );
-        let dashboard = render_dashboard_with_hint(&snapshot, colors, layout, Some(args.interval));
+        let layout = dashboard_layout(&snapshot, args.display.compact, columns);
+        let hint = refresh_hint(args.interval, args.interval, columns);
+        let dashboard = render_dashboard_with_hint(&snapshot, colors, layout, Some(&hint));
         if terminal {
             print!("\x1b[2J\x1b[H");
         }
@@ -170,13 +170,49 @@ fn watch(args: &WatchArgs) -> i32 {
             .transpose()
             .ok()
             .flatten();
-        if matches!(
-            wait_for_action(Duration::from_secs(args.interval), raw_mode.is_some()),
-            WaitAction::Exit
-        ) {
-            return 0;
+        let deadline = Instant::now() + Duration::from_secs(args.interval);
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let timeout = if terminal {
+                remaining.min(Duration::from_secs(1))
+            } else {
+                remaining
+            };
+            match wait_for_action(timeout, raw_mode.is_some()) {
+                WaitAction::Exit => return 0,
+                WaitAction::Resize => break,
+                WaitAction::Timeout => {
+                    let remaining = seconds_remaining(deadline);
+                    if terminal {
+                        update_dashboard_title(
+                            colors,
+                            &refresh_hint(args.interval, remaining, columns),
+                        );
+                    }
+                    if remaining == 0 {
+                        break;
+                    }
+                }
+            }
         }
     }
+}
+
+fn seconds_remaining(deadline: Instant) -> u64 {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    remaining.as_secs() + u64::from(remaining.subsec_nanos() != 0)
+}
+
+fn update_dashboard_title(colors: bool, hint: &str) {
+    let mut stdout = io::stdout();
+    let _ = execute!(
+        stdout,
+        SavePosition,
+        MoveTo(0, 0),
+        Clear(ClearType::CurrentLine),
+        Print(dashboard_title_with_hint(colors, Some(hint))),
+        RestorePosition
+    );
 }
 
 struct RawMode;
@@ -196,26 +232,27 @@ impl Drop for RawMode {
 
 enum WaitAction {
     Exit,
-    Refresh,
+    Resize,
+    Timeout,
 }
 
 fn wait_for_action(timeout: Duration, read_keys: bool) -> WaitAction {
     if !read_keys {
         thread::sleep(timeout);
-        return WaitAction::Refresh;
+        return WaitAction::Timeout;
     }
 
     let deadline = Instant::now() + timeout;
     loop {
         let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
-            return WaitAction::Refresh;
+            return WaitAction::Timeout;
         };
         if !event::poll(remaining).unwrap_or(false) {
-            return WaitAction::Refresh;
+            return WaitAction::Timeout;
         }
         match event::read() {
             Ok(Event::Key(key)) if is_exit_key(key) => return WaitAction::Exit,
-            Ok(event) if is_resize_event(&event) => return WaitAction::Refresh,
+            Ok(event) if is_resize_event(&event) => return WaitAction::Resize,
             _ => {}
         }
     }
@@ -873,11 +910,11 @@ fn render_dashboard_with_hint(
     snapshot: &Snapshot,
     colors: bool,
     layout: DashboardLayout,
-    refresh_interval: Option<u64>,
+    refresh_hint: Option<&str>,
 ) -> String {
     let reset_width = dashboard_reset_width(snapshot);
     let DashboardLayout { compact, bar_width } = layout;
-    let mut lines = vec![dashboard_title_with_hint(colors, refresh_interval)];
+    let mut lines = vec![dashboard_title_with_hint(colors, refresh_hint)];
     let mut rendered_header = false;
     for (index, provider) in snapshot.providers.iter().enumerate() {
         if index > 0 {
@@ -967,12 +1004,10 @@ fn dashboard_title(colors: bool) -> String {
     dashboard_title_with_hint(colors, None)
 }
 
-fn dashboard_title_with_hint(colors: bool, refresh_interval: Option<u64>) -> String {
+fn dashboard_title_with_hint(colors: bool, refresh_hint: Option<&str>) -> String {
     const TITLE: &str = " LLM USAGE";
     const SUBTITLE: &str = " · subscription quotas";
-    let refresh = refresh_interval.map_or(String::new(), |interval| {
-        format!(" · refresh: {interval}s · q to exit")
-    });
+    let refresh_hint = refresh_hint.unwrap_or_default();
     if colors {
         format!(
             "{}{}{TITLE}{}{}{}",
@@ -980,11 +1015,41 @@ fn dashboard_title_with_hint(colors: bool, refresh_interval: Option<u64>) -> Str
             SetForegroundColor(Color::Blue),
             SetAttribute(Attribute::Reset),
             muted_text(SUBTITLE),
-            muted_text(&refresh)
+            muted_text(refresh_hint)
         )
     } else {
-        format!("{TITLE}{SUBTITLE}{refresh}")
+        format!("{TITLE}{SUBTITLE}{refresh_hint}")
     }
+}
+
+fn refresh_hint(interval: u64, remaining: u64, columns: Option<u16>) -> String {
+    const MAX_DOTS: usize = 30;
+    const FIXED_HINT: &str = " · refresh: [] · q to exit";
+
+    let Some(columns) = columns else {
+        return format!(" · refresh: {remaining}s · q to exit");
+    };
+    let fixed_width = dashboard_title_with_hint(false, Some(FIXED_HINT))
+        .chars()
+        .count();
+    let width = usize::from(columns)
+        .saturating_sub(fixed_width)
+        .min(MAX_DOTS)
+        .min(usize::try_from(interval).unwrap_or(MAX_DOTS));
+    if width == 0 {
+        return format!(" · refresh: {remaining}s · q to exit");
+    }
+
+    let active = usize::try_from(
+        (u128::from(remaining.min(interval)) * u128::try_from(width).unwrap_or_default())
+            .div_ceil(u128::from(interval)),
+    )
+    .unwrap_or(width);
+    format!(
+        " · refresh: [{}{}] · q to exit",
+        ".".repeat(active),
+        " ".repeat(width - active)
+    )
 }
 
 fn colored_usage_bar(percent: u8, width: usize, colors: bool) -> String {
@@ -1178,6 +1243,33 @@ mod tests {
             KeyCode::Char('q'),
             KeyModifiers::NONE,
         ))));
+    }
+
+    #[test]
+    fn refresh_hint_counts_down_from_right_to_left() {
+        let full = refresh_hint(30, 30, Some(100));
+        let half = refresh_hint(30, 15, Some(100));
+        let empty = refresh_hint(30, 0, Some(100));
+        let dot_count = |hint: &str| hint.chars().filter(|character| *character == '.').count();
+
+        assert_eq!(dot_count(&full), 30);
+        assert_eq!(dot_count(&half), 15);
+        assert_eq!(dot_count(&empty), 0);
+        assert_eq!(full.chars().count(), half.chars().count());
+        assert_eq!(half.chars().count(), empty.chars().count());
+    }
+
+    #[test]
+    fn refresh_hint_scales_and_falls_back_to_seconds() {
+        assert_eq!(
+            refresh_hint(60, 30, Some(100))
+                .chars()
+                .filter(|character| *character == '.')
+                .count(),
+            15
+        );
+        assert_eq!(refresh_hint(30, 12, None), " · refresh: 12s · q to exit");
+        assert_eq!(refresh_hint(30, 12, Some(1)), " · refresh: 12s · q to exit");
     }
 
     #[test]
