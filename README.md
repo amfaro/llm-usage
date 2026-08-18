@@ -56,33 +56,40 @@ The API key is sent as a `Bearer` token to `GET https://opencode.ai/zen/go/v1/us
 
 `once` and `json` exit `0` when at least one selected provider returns usage, otherwise `1`. Unavailable providers remain in text and JSON output with a redacted error. `watch` keeps retrying on later refreshes.
 
-## JSON shape
+## JSON contract
 
 ```json
 {
+  "schema_version": 1,
   "fetched_at": 1783871200,
   "providers": [
     {
       "provider": "codex",
+      "status": "ok",
       "available": true,
       "plan": "plus",
       "source": "oauth",
       "windows": [
-        { "label": "5h", "used_percent": 42, "reset_at": 1783874800, "window_seconds": 18000 }
-      ],
-      "fetched_at": 1783871200
-    },
-    {
-      "provider": "claude-code",
-      "available": true,
-      "plan": "max_5x",
-      "source": "oauth",
-      "windows": [
-        { "label": "5h", "used_percent": 31.2, "reset_at": 1783874800, "window_seconds": 18000 },
-        { "label": "7d", "used_percent": 64.0, "reset_at": 1784393200, "window_seconds": 604800 }
+        {
+          "label": "5h",
+          "status": "ok",
+          "used_percent": 42,
+          "reset_at": 1783874800,
+          "window_seconds": 18000
+        }
       ],
       "fetched_at": 1783871200
     }
   ]
 }
 ```
+
+Provider and window `status` values are:
+
+- `ok`: usage was fetched and the quota is usable.
+- `rate_limited`: a window reached 100% or the provider marked it rate-limited; provider status follows when any window is rate-limited.
+- `unavailable`: provider usage could not be fetched, or an expected window was absent from the response.
+
+`used_percent` remains numeric. `reset_at` and `fetched_at` are Unix timestamps in seconds, and `window_seconds` is a numeric duration in seconds. Optional fields are omitted when unavailable. Provider errors remain redacted and contain no credentials or upstream response bodies.
+
+`schema_version` changes only for breaking field removals, type changes, or semantic changes. New optional fields may be added without changing it. Version 1 retains `available` and `limit_reached` for existing consumers; new consumers should use `status` instead.

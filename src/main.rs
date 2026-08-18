@@ -20,6 +20,7 @@ use reqwest::blocking::Client;
 use serde::Serialize;
 use serde_json::Value;
 
+const JSON_SCHEMA_VERSION: u8 = 1;
 const BAR_WIDTH: usize = 28;
 const BAR_WIDTH_COMPACT: usize = 16;
 const PROVIDER_WIDTH: usize = 11;
@@ -101,8 +102,17 @@ impl Provider {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum UsageStatus {
+    Ok,
+    Unavailable,
+    RateLimited,
+}
+
 #[derive(Serialize)]
 struct Snapshot {
+    schema_version: u8,
     fetched_at: u64,
     providers: Vec<ProviderUsage>,
 }
@@ -110,6 +120,7 @@ struct Snapshot {
 #[derive(Serialize)]
 struct ProviderUsage {
     provider: &'static str,
+    status: UsageStatus,
     available: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     plan: Option<String>,
@@ -124,6 +135,7 @@ struct ProviderUsage {
 #[derive(Serialize)]
 struct UsageWindow {
     label: &'static str,
+    status: UsageStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
     used_percent: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -341,6 +353,7 @@ fn fetch_snapshot(requested: &[Provider]) -> Snapshot {
         .expect("HTTP client builds");
 
     Snapshot {
+        schema_version: JSON_SCHEMA_VERSION,
         fetched_at,
         providers: providers
             .into_iter()
@@ -356,6 +369,7 @@ fn fetch_snapshot(requested: &[Provider]) -> Snapshot {
 fn unavailable(provider: Provider, error: &'static str, fetched_at: u64) -> ProviderUsage {
     ProviderUsage {
         provider: provider.name(),
+        status: UsageStatus::Unavailable,
         available: false,
         plan: None,
         source: None,
@@ -413,6 +427,7 @@ fn fetch_codex(client: &Client, fetched_at: u64) -> ProviderUsage {
     }
     ProviderUsage {
         provider: Provider::Codex.name(),
+        status: provider_status(&windows),
         available: true,
         plan: data
             .get("plan_type")
@@ -453,25 +468,28 @@ fn codex_window(raw: Option<&Value>, fallback: &'static str, data: &Value) -> Op
     let raw = raw?;
     let used_percent = raw.get("used_percent")?.as_f64()?.clamp(0.0, 100.0);
     let window_seconds = raw.get("limit_window_seconds").and_then(Value::as_u64);
+    let limit_reached = data
+        .get("limit_reached")
+        .and_then(Value::as_bool)
+        .or_else(|| {
+            data.pointer("/rate_limit/limit_reached")
+                .and_then(Value::as_bool)
+        })
+        .or_else(|| raw.get("limit_reached").and_then(Value::as_bool));
     Some(UsageWindow {
         label: window_label(window_seconds, fallback),
+        status: window_status(used_percent, limit_reached),
         used_percent: Some(used_percent),
         reset_at: raw.get("reset_at").and_then(Value::as_u64),
         window_seconds,
-        limit_reached: data
-            .get("limit_reached")
-            .and_then(Value::as_bool)
-            .or_else(|| {
-                data.pointer("/rate_limit/limit_reached")
-                    .and_then(Value::as_bool)
-            })
-            .or_else(|| raw.get("limit_reached").and_then(Value::as_bool)),
+        limit_reached,
     })
 }
 
 fn unavailable_window(label: &'static str) -> UsageWindow {
     UsageWindow {
         label,
+        status: UsageStatus::Unavailable,
         used_percent: None,
         reset_at: None,
         window_seconds: None,
@@ -630,6 +648,7 @@ fn fetch_claude_code(client: &Client, fetched_at: u64) -> ProviderUsage {
     }
     ProviderUsage {
         provider: Provider::ClaudeCode.name(),
+        status: provider_status(&windows),
         available: true,
         plan: plan.or_else(|| {
             data.get("plan")
@@ -671,6 +690,7 @@ fn claude_code_window(
         .map(|dt| u64::try_from(dt.with_timezone(&Utc).timestamp()).unwrap_or(0));
     Some(UsageWindow {
         label,
+        status: window_status(used_percent, None),
         used_percent: Some(used_percent),
         reset_at,
         window_seconds: Some(seconds),
@@ -841,6 +861,7 @@ fn fetch_opencode_go(client: &Client, fetched_at: u64) -> ProviderUsage {
     }
     ProviderUsage {
         provider: Provider::OpencodeGo.name(),
+        status: provider_status(&windows),
         available: true,
         plan: Some("Go".to_owned()),
         source: Some("api"),
@@ -879,13 +900,34 @@ fn opencode_api_window(
         .get("status")
         .and_then(Value::as_str)
         .map(|s| s == "rate-limited");
+    let used_percent = percent.clamp(0.0, 100.0);
     Some(UsageWindow {
         label,
-        used_percent: Some(percent.clamp(0.0, 100.0)),
+        status: window_status(used_percent, limit_reached),
+        used_percent: Some(used_percent),
         reset_at: Some(reset_at),
         window_seconds: Some(seconds),
         limit_reached,
     })
+}
+
+fn window_status(used_percent: f64, limit_reached: Option<bool>) -> UsageStatus {
+    if limit_reached == Some(true) || used_percent >= 100.0 {
+        UsageStatus::RateLimited
+    } else {
+        UsageStatus::Ok
+    }
+}
+
+fn provider_status(windows: &[UsageWindow]) -> UsageStatus {
+    if windows
+        .iter()
+        .any(|window| window.status == UsageStatus::RateLimited)
+    {
+        UsageStatus::RateLimited
+    } else {
+        UsageStatus::Ok
+    }
 }
 
 fn dashboard_reset_width(snapshot: &Snapshot) -> usize {
@@ -1243,6 +1285,7 @@ mod tests {
 
     fn empty_snapshot() -> Snapshot {
         Snapshot {
+            schema_version: JSON_SCHEMA_VERSION,
             fetched_at: 1_000,
             providers: Vec::new(),
         }
@@ -1373,14 +1416,59 @@ mod tests {
         let windows = opencode_api_windows(&data);
         assert_eq!(windows.len(), 2);
         assert_eq!(windows[0].label, "5h");
+        assert_eq!(windows[0].status, UsageStatus::Ok);
         assert_eq!(windows[0].used_percent, Some(50.0));
         assert!(windows[0].reset_at.unwrap() > 1_000);
         assert_eq!(windows[0].window_seconds, Some(18_000));
         assert_eq!(windows[0].limit_reached, Some(false));
         assert_eq!(windows[1].label, "7d");
+        assert_eq!(windows[1].status, UsageStatus::RateLimited);
         assert_eq!(windows[1].used_percent, Some(75.0));
         assert_eq!(windows[1].limit_reached, Some(true));
         assert_eq!(windows[1].window_seconds, Some(604_800));
+    }
+
+    #[test]
+    fn json_contract_includes_version_statuses_and_numeric_fields() {
+        let snapshot = Snapshot {
+            schema_version: JSON_SCHEMA_VERSION,
+            fetched_at: 1_000,
+            providers: vec![
+                ProviderUsage {
+                    provider: "opencode-go",
+                    status: UsageStatus::RateLimited,
+                    available: true,
+                    plan: None,
+                    source: Some("api_key"),
+                    windows: vec![
+                        UsageWindow {
+                            label: "5h",
+                            status: UsageStatus::RateLimited,
+                            used_percent: Some(100.0),
+                            reset_at: Some(2_000),
+                            window_seconds: Some(18_000),
+                            limit_reached: Some(true),
+                        },
+                        unavailable_window("7d"),
+                    ],
+                    error: None,
+                    fetched_at: 1_000,
+                },
+                unavailable(Provider::Codex, "unavailable", 1_000),
+            ],
+        };
+
+        let json = serde_json::to_value(snapshot).unwrap();
+        assert_eq!(json["schema_version"], 1);
+        assert_eq!(json["fetched_at"], 1_000);
+        assert_eq!(json["providers"][0]["status"], "rate_limited");
+        assert_eq!(json["providers"][0]["windows"][0]["status"], "rate_limited");
+        assert_eq!(json["providers"][0]["windows"][0]["used_percent"], 100.0);
+        assert_eq!(json["providers"][0]["windows"][0]["reset_at"], 2_000);
+        assert_eq!(json["providers"][0]["windows"][0]["window_seconds"], 18_000);
+        assert_eq!(json["providers"][0]["windows"][1]["status"], "unavailable");
+        assert!(json["providers"][0]["windows"][1]["used_percent"].is_null());
+        assert_eq!(json["providers"][1]["status"], "unavailable");
     }
 
     #[test]
@@ -1406,15 +1494,18 @@ mod tests {
     #[test]
     fn dashboard_labels_usage_and_right_aligns_resets() {
         let snapshot = Snapshot {
+            schema_version: JSON_SCHEMA_VERSION,
             fetched_at: 1_000,
             providers: vec![ProviderUsage {
                 provider: "codex",
+                status: UsageStatus::Ok,
                 available: true,
                 plan: Some("Plus".to_owned()),
                 source: None,
                 windows: vec![
                     UsageWindow {
                         label: "5h",
+                        status: UsageStatus::Ok,
                         used_percent: Some(50.0),
                         reset_at: Some(4_600),
                         window_seconds: Some(18_000),
@@ -1422,6 +1513,7 @@ mod tests {
                     },
                     UsageWindow {
                         label: "7d",
+                        status: UsageStatus::Ok,
                         used_percent: Some(50.0),
                         reset_at: Some(91_061),
                         window_seconds: Some(604_800),
@@ -1459,9 +1551,11 @@ mod tests {
     #[test]
     fn dashboard_mutes_unavailable_windows() {
         let snapshot = Snapshot {
+            schema_version: JSON_SCHEMA_VERSION,
             fetched_at: 1_000,
             providers: vec![ProviderUsage {
                 provider: "codex",
+                status: UsageStatus::Ok,
                 available: true,
                 plan: None,
                 source: None,
@@ -1487,15 +1581,18 @@ mod tests {
     #[test]
     fn dashboard_separates_providers() {
         let snapshot = Snapshot {
+            schema_version: JSON_SCHEMA_VERSION,
             fetched_at: 1_000,
             providers: vec![
                 ProviderUsage {
                     provider: "codex",
+                    status: UsageStatus::Ok,
                     available: true,
                     plan: None,
                     source: None,
                     windows: vec![UsageWindow {
                         label: "5h",
+                        status: UsageStatus::Ok,
                         used_percent: Some(50.0),
                         reset_at: Some(4_600),
                         window_seconds: Some(18_000),
@@ -1519,6 +1616,7 @@ mod tests {
     #[test]
     fn dashboard_includes_unavailable_providers() {
         let snapshot = Snapshot {
+            schema_version: JSON_SCHEMA_VERSION,
             fetched_at: 1_000,
             providers: vec![unavailable(
                 Provider::Codex,
@@ -1536,14 +1634,17 @@ mod tests {
     #[test]
     fn compact_layout_stacks_provider_and_uses_narrow_bars() {
         let snapshot = Snapshot {
+            schema_version: JSON_SCHEMA_VERSION,
             fetched_at: 1_000,
             providers: vec![ProviderUsage {
                 provider: "codex",
+                status: UsageStatus::Ok,
                 available: true,
                 plan: None,
                 source: None,
                 windows: vec![UsageWindow {
                     label: "5h",
+                    status: UsageStatus::Ok,
                     used_percent: Some(50.0),
                     reset_at: Some(4_600),
                     window_seconds: Some(18_000),
@@ -1566,15 +1667,18 @@ mod tests {
     #[test]
     fn compact_layout_separates_providers() {
         let snapshot = Snapshot {
+            schema_version: JSON_SCHEMA_VERSION,
             fetched_at: 1_000,
             providers: vec![
                 ProviderUsage {
                     provider: "codex",
+                    status: UsageStatus::Ok,
                     available: true,
                     plan: None,
                     source: None,
                     windows: vec![UsageWindow {
                         label: "5h",
+                        status: UsageStatus::Ok,
                         used_percent: Some(50.0),
                         reset_at: Some(4_600),
                         window_seconds: Some(18_000),
@@ -1595,6 +1699,7 @@ mod tests {
     #[test]
     fn compact_layout_shows_unavailable_provider() {
         let snapshot = Snapshot {
+            schema_version: JSON_SCHEMA_VERSION,
             fetched_at: 1_000,
             providers: vec![unavailable(
                 Provider::Codex,
@@ -1612,9 +1717,11 @@ mod tests {
     #[test]
     fn compact_layout_mutes_unavailable_window() {
         let snapshot = Snapshot {
+            schema_version: JSON_SCHEMA_VERSION,
             fetched_at: 1_000,
             providers: vec![ProviderUsage {
                 provider: "codex",
+                status: UsageStatus::Ok,
                 available: true,
                 plan: None,
                 source: None,
@@ -1635,15 +1742,18 @@ mod tests {
     #[test]
     fn compact_layout_with_multiple_windows() {
         let snapshot = Snapshot {
+            schema_version: JSON_SCHEMA_VERSION,
             fetched_at: 1_000,
             providers: vec![ProviderUsage {
                 provider: "codex",
+                status: UsageStatus::Ok,
                 available: true,
                 plan: None,
                 source: None,
                 windows: vec![
                     UsageWindow {
                         label: "5h",
+                        status: UsageStatus::Ok,
                         used_percent: Some(50.0),
                         reset_at: Some(4_600),
                         window_seconds: Some(18_000),
@@ -1651,6 +1761,7 @@ mod tests {
                     },
                     UsageWindow {
                         label: "7d",
+                        status: UsageStatus::Ok,
                         used_percent: Some(25.0),
                         reset_at: Some(10_000),
                         window_seconds: Some(604_800),
@@ -1658,6 +1769,7 @@ mod tests {
                     },
                     UsageWindow {
                         label: "30d",
+                        status: UsageStatus::Ok,
                         used_percent: Some(10.0),
                         reset_at: Some(100_000),
                         window_seconds: Some(2_592_000),
@@ -1683,9 +1795,11 @@ mod tests {
     #[test]
     fn compact_layout_with_colors() {
         let snapshot = Snapshot {
+            schema_version: JSON_SCHEMA_VERSION,
             fetched_at: 1_000,
             providers: vec![ProviderUsage {
                 provider: "codex",
+                status: UsageStatus::Ok,
                 available: true,
                 plan: None,
                 source: None,
