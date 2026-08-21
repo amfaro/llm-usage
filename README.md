@@ -60,7 +60,7 @@ The API key is sent as a `Bearer` token to `GET https://opencode.ai/zen/go/v1/us
 
 ```json
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "fetched_at": 1783871200,
   "providers": [
     {
@@ -87,9 +87,10 @@ The API key is sent as a `Bearer` token to `GET https://opencode.ai/zen/go/v1/us
 Provider and window `status` values are:
 
 - `ok`: usage was fetched and the quota is usable.
+- `stale`: cached provider usage remains usable, but its latest refresh failed or was throttled.
 - `rate_limited`: a window reached 100% or the provider marked it rate-limited; provider status follows when any window is rate-limited.
 - `unavailable`: provider usage could not be fetched, or an expected window was absent from the response.
 
 `used_percent` remains numeric. `reset_at` and `fetched_at` are Unix timestamps in seconds, and `window_seconds` is a numeric duration in seconds. Optional fields are omitted when unavailable. Provider errors remain redacted and contain no credentials or upstream response bodies.
 
-`schema_version` changes only for breaking field removals, type changes, or semantic changes. New optional fields may be added without changing it. Version 1 retains `available` and `limit_reached` for existing consumers; new consumers should use `status` instead.
+`schema_version` changes only for breaking field removals, type changes, or semantic changes. New optional fields may be added without changing it. Version 2 adds the `stale` provider status so cached usage is distinct from unavailable usage. It retains `available` and `limit_reached` for existing consumers; new consumers should use `status` instead.
