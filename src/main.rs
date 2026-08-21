@@ -24,7 +24,7 @@ use reqwest::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-const JSON_SCHEMA_VERSION: u8 = 1;
+const JSON_SCHEMA_VERSION: u8 = 2;
 const BAR_WIDTH: usize = 28;
 const BAR_WIDTH_COMPACT: usize = 16;
 const PROVIDER_WIDTH: usize = 11;
@@ -115,6 +115,7 @@ impl Provider {
 #[serde(rename_all = "snake_case")]
 enum UsageStatus {
     Ok,
+    Stale,
     Unavailable,
     RateLimited,
 }
@@ -870,7 +871,7 @@ fn cached_claude_code_usage(
     }
     Some(ProviderUsage {
         provider: Provider::ClaudeCode.name(),
-        status: UsageStatus::Unavailable,
+        status: UsageStatus::Stale,
         available: true,
         plan: cache.plan.clone(),
         source: Some("oauth"),
@@ -1270,8 +1271,8 @@ fn render_dashboard_with_hint(
         if compact {
             lines.push(format!(" {label}"));
         }
-        if provider.status == UsageStatus::Unavailable {
-            let error = provider.error.as_deref().unwrap_or("usage unavailable");
+        if provider.status == UsageStatus::Stale {
+            let error = provider.error.as_deref().unwrap_or("cached usage is stale");
             if compact {
                 lines.push(format!("   stale: {error}"));
             } else {
@@ -1633,7 +1634,7 @@ mod tests {
         assert_eq!(persisted.refresh_after, 2_000);
         assert_eq!(persisted.cooldown, Some(ClaudeCodeCooldown::RateLimited));
         assert!(stale.available);
-        assert_eq!(stale.status, UsageStatus::Unavailable);
+        assert_eq!(stale.status, UsageStatus::Stale);
         assert_eq!(stale.fetched_at, 1_000);
         assert!(
             stale
@@ -1658,8 +1659,11 @@ mod tests {
             fetched_at: 1_100,
             providers: vec![stale],
         };
+        let json = serde_json::to_value(&snapshot).unwrap();
         let dashboard = render_dashboard(&snapshot, false, default_layout(false));
 
+        assert_eq!(json["schema_version"], 2);
+        assert_eq!(json["providers"][0]["status"], "stale");
         assert!(dashboard.contains("stale:"));
         assert!(dashboard.contains("cached data is 1m 40s old"));
     }
@@ -1840,7 +1844,7 @@ mod tests {
         };
 
         let json = serde_json::to_value(snapshot).unwrap();
-        assert_eq!(json["schema_version"], 1);
+        assert_eq!(json["schema_version"], 2);
         assert_eq!(json["fetched_at"], 1_000);
         assert_eq!(json["providers"][0]["status"], "rate_limited");
         assert_eq!(json["providers"][0]["windows"][0]["status"], "rate_limited");
