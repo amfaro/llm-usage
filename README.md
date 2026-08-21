@@ -42,7 +42,7 @@ Claude Code authentication mirrors the Codex lookup order, but uses a Claude Cod
 The token is sent as a `Bearer` token to Anthropic's internal OAuth usage endpoint. If the endpoint returns rate limits or rejects the token (for example, when using an `ANTHROPIC_API_KEY` instead of an OAuth session), the dashboard shows an `unavailable` row with a clear message.
 
 > [!NOTE]
-> The Claude Code usage endpoint is undocumented and may change or rate-limit aggressively. The dashboard degrades gracefully on any error.
+> The Claude Code usage endpoint is undocumented and may change or rate-limit aggressively. Retryable failures are retried once with a bounded delay. In `watch` mode, a failed refresh keeps the last successful windows visible and marks the provider `stale`; authentication failures remain unavailable.
 
 ### OpenCode Go
 

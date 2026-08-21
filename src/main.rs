@@ -16,7 +16,11 @@ use crossterm::{
     style::{Attribute, Color, Print, ResetColor, SetAttribute, SetForegroundColor},
     terminal::{Clear, ClearType, disable_raw_mode, enable_raw_mode, size},
 };
-use reqwest::blocking::Client;
+use reqwest::{
+    StatusCode,
+    blocking::Client,
+    header::{HeaderValue, RETRY_AFTER},
+};
 use serde::Serialize;
 use serde_json::Value;
 
@@ -29,6 +33,10 @@ const COMPACT_WINDOW_WIDTH: usize = 3;
 const RESET_WIDTH: usize = "unavailable".len();
 const CODEX_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
 const CLAUDE_CODE_USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
+const CLAUDE_CODE_REQUEST_ERROR: &str = "Claude Code usage request failed";
+const CLAUDE_CODE_TRANSIENT_ERROR: &str = "Claude Code usage request failed after retry";
+const CLAUDE_CODE_RETRY_DELAY: Duration = Duration::from_secs(1);
+const CLAUDE_CODE_MAX_RETRY_DELAY: Duration = Duration::from_secs(5);
 const OPENCODE_GO_USAGE_URL: &str = "https://opencode.ai/zen/go/v1/usage";
 
 #[derive(Parser)]
@@ -110,14 +118,14 @@ enum UsageStatus {
     RateLimited,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 struct Snapshot {
     schema_version: u8,
     fetched_at: u64,
     providers: Vec<ProviderUsage>,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 struct ProviderUsage {
     provider: &'static str,
     status: UsageStatus,
@@ -128,11 +136,11 @@ struct ProviderUsage {
     source: Option<&'static str>,
     windows: Vec<UsageWindow>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    error: Option<&'static str>,
+    error: Option<String>,
     fetched_at: u64,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 struct UsageWindow {
     label: &'static str,
     status: UsageStatus,
@@ -164,10 +172,13 @@ fn main() {
 fn watch(args: &WatchArgs) -> i32 {
     let terminal = io::stdout().is_terminal();
     let colors = terminal && !args.display.no_color && env::var_os("NO_COLOR").is_none();
+    let mut previous = None;
     loop {
         let dimensions = terminal.then(size).and_then(Result::ok);
         let columns = dimensions.map(|(columns, _)| columns);
-        let snapshot = fetch_snapshot(&args.display.query.providers);
+        let mut snapshot = fetch_snapshot(&args.display.query.providers);
+        retain_stale_claude_usage(&mut snapshot, previous.as_ref());
+        previous = Some(snapshot.clone());
         let layout = dashboard_layout(&snapshot, args.display.compact, columns);
         let hint = refresh_hint(args.interval, args.interval, columns);
         let dashboard = render_dashboard_with_hint(&snapshot, colors, layout, Some(&hint), columns);
@@ -366,7 +377,7 @@ fn fetch_snapshot(requested: &[Provider]) -> Snapshot {
     }
 }
 
-fn unavailable(provider: Provider, error: &'static str, fetched_at: u64) -> ProviderUsage {
+fn unavailable(provider: Provider, error: impl Into<String>, fetched_at: u64) -> ProviderUsage {
     ProviderUsage {
         provider: provider.name(),
         status: UsageStatus::Unavailable,
@@ -374,9 +385,45 @@ fn unavailable(provider: Provider, error: &'static str, fetched_at: u64) -> Prov
         plan: None,
         source: None,
         windows: vec![],
-        error: Some(error),
+        error: Some(error.into()),
         fetched_at,
     }
+}
+
+fn retain_stale_claude_usage(snapshot: &mut Snapshot, previous: Option<&Snapshot>) {
+    let Some((index, error)) =
+        snapshot
+            .providers
+            .iter()
+            .enumerate()
+            .find_map(|(index, provider)| {
+                (provider.provider == Provider::ClaudeCode.name()
+                    && !provider.available
+                    && provider
+                        .error
+                        .as_deref()
+                        .is_some_and(|error| error.starts_with(CLAUDE_CODE_TRANSIENT_ERROR)))
+                .then(|| (index, provider.error.clone()))
+            })
+    else {
+        return;
+    };
+    let Some(mut stale) = previous
+        .and_then(|snapshot| {
+            snapshot
+                .providers
+                .iter()
+                .find(|provider| provider.provider == Provider::ClaudeCode.name())
+        })
+        .filter(|provider| !provider.windows.is_empty())
+        .cloned()
+    else {
+        return;
+    };
+    stale.status = UsageStatus::Unavailable;
+    stale.available = true;
+    stale.error = error;
+    snapshot.providers[index] = stale;
 }
 
 fn fetch_codex(client: &Client, fetched_at: u64) -> ProviderUsage {
@@ -606,26 +653,52 @@ fn fetch_claude_code(client: &Client, fetched_at: u64) -> ProviderUsage {
             fetched_at,
         );
     };
-    let request = client
-        .get(CLAUDE_CODE_USAGE_URL)
-        .header("Accept", "application/json")
-        .header("anthropic-beta", "oauth-2025-04-20")
-        .bearer_auth(access_token);
-    let response = match request.send() {
-        Ok(response) if response.status().is_success() => response,
-        Ok(response) if response.status().as_u16() == 401 || response.status().as_u16() == 403 => {
-            return unavailable(
-                Provider::ClaudeCode,
-                "Claude Code OAuth credential was rejected",
-                fetched_at,
-            );
-        }
-        Ok(_) | Err(_) => {
-            return unavailable(
-                Provider::ClaudeCode,
-                "Claude Code usage request failed",
-                fetched_at,
-            );
+    let mut attempted_retry = false;
+    let response = loop {
+        let response = client
+            .get(CLAUDE_CODE_USAGE_URL)
+            .header("Accept", "application/json")
+            .header("anthropic-beta", "oauth-2025-04-20")
+            .bearer_auth(&access_token)
+            .send();
+        match response {
+            Ok(response) if response.status().is_success() => break response,
+            Ok(response)
+                if response.status() == StatusCode::UNAUTHORIZED
+                    || response.status() == StatusCode::FORBIDDEN =>
+            {
+                return unavailable(
+                    Provider::ClaudeCode,
+                    "Claude Code OAuth credential was rejected",
+                    fetched_at,
+                );
+            }
+            Ok(response) => {
+                let status = response.status();
+                let retry_after =
+                    claude_code_retry_after(response.headers().get(RETRY_AFTER), Utc::now());
+                if !attempted_retry && claude_code_retryable(status) {
+                    thread::sleep(claude_code_retry_delay(retry_after));
+                    attempted_retry = true;
+                    continue;
+                }
+                return unavailable(
+                    Provider::ClaudeCode,
+                    claude_code_http_error(status, retry_after, attempted_retry),
+                    fetched_at,
+                );
+            }
+            Err(_) if !attempted_retry => {
+                thread::sleep(CLAUDE_CODE_RETRY_DELAY);
+                attempted_retry = true;
+            }
+            Err(_) => {
+                return unavailable(
+                    Provider::ClaudeCode,
+                    CLAUDE_CODE_TRANSIENT_ERROR,
+                    fetched_at,
+                );
+            }
         }
     };
     let data: Value = match response.json() {
@@ -660,6 +733,50 @@ fn fetch_claude_code(client: &Client, fetched_at: u64) -> ProviderUsage {
         error: None,
         fetched_at,
     }
+}
+
+fn claude_code_retryable(status: StatusCode) -> bool {
+    status == StatusCode::REQUEST_TIMEOUT
+        || status == StatusCode::TOO_MANY_REQUESTS
+        || status.is_server_error()
+}
+
+fn claude_code_retry_after(value: Option<&HeaderValue>, now: DateTime<Utc>) -> Option<u64> {
+    let value = value?.to_str().ok()?;
+    if let Ok(seconds) = value.parse() {
+        return Some(seconds);
+    }
+    let retry_at = DateTime::parse_from_rfc2822(value)
+        .ok()?
+        .with_timezone(&Utc);
+    u64::try_from((retry_at - now).num_seconds().max(0)).ok()
+}
+
+fn claude_code_retry_delay(retry_after: Option<u64>) -> Duration {
+    retry_after.map_or(CLAUDE_CODE_RETRY_DELAY, |seconds| {
+        Duration::from_secs(seconds.min(CLAUDE_CODE_MAX_RETRY_DELAY.as_secs()))
+    })
+}
+
+fn claude_code_http_error(
+    status: StatusCode,
+    retry_after: Option<u64>,
+    attempted_retry: bool,
+) -> String {
+    let prefix = if attempted_retry && claude_code_retryable(status) {
+        CLAUDE_CODE_TRANSIENT_ERROR
+    } else {
+        CLAUDE_CODE_REQUEST_ERROR
+    };
+    retry_after.map_or_else(
+        || format!("{prefix} (HTTP {})", status.as_u16()),
+        |seconds| {
+            format!(
+                "{prefix} (HTTP {}; retry-after {seconds}s)",
+                status.as_u16()
+            )
+        },
+    )
 }
 
 fn claude_code_windows(data: &Value) -> Vec<UsageWindow> {
@@ -975,13 +1092,13 @@ fn render_dashboard_with_hint(
                 lines.push(format!(" {label}"));
                 lines.push(format!(
                     "   unavailable: {}",
-                    provider.error.unwrap_or("usage unavailable")
+                    provider.error.as_deref().unwrap_or("usage unavailable")
                 ));
             } else {
                 lines.push(format!(
                     " {:<PROVIDER_WIDTH$} unavailable: {}",
                     label,
-                    provider.error.unwrap_or("usage unavailable")
+                    provider.error.as_deref().unwrap_or("usage unavailable")
                 ));
             }
             continue;
@@ -999,6 +1116,14 @@ fn render_dashboard_with_hint(
         }
         if compact {
             lines.push(format!(" {label}"));
+        }
+        if provider.status == UsageStatus::Unavailable {
+            let error = provider.error.as_deref().unwrap_or("usage unavailable");
+            if compact {
+                lines.push(format!("   stale: {error}"));
+            } else {
+                lines.push(format!(" {label:<PROVIDER_WIDTH$} stale: {error}"));
+            }
         }
         for window in &provider.windows {
             let Some(used_percent) = window.used_percent else {
@@ -1289,6 +1414,81 @@ mod tests {
             fetched_at: 1_000,
             providers: Vec::new(),
         }
+    }
+
+    #[test]
+    fn claude_code_retries_only_temporary_failures_with_bounded_delay() {
+        assert!(claude_code_retryable(StatusCode::REQUEST_TIMEOUT));
+        assert!(claude_code_retryable(StatusCode::TOO_MANY_REQUESTS));
+        assert!(claude_code_retryable(StatusCode::BAD_GATEWAY));
+        assert!(!claude_code_retryable(StatusCode::UNAUTHORIZED));
+        assert!(!claude_code_retryable(StatusCode::BAD_REQUEST));
+
+        let retry_after = HeaderValue::from_static("60");
+        let seconds = claude_code_retry_after(Some(&retry_after), Utc::now());
+        assert_eq!(seconds, Some(60));
+        assert_eq!(claude_code_retry_delay(seconds), Duration::from_secs(5));
+        assert_eq!(
+            claude_code_http_error(StatusCode::TOO_MANY_REQUESTS, seconds, true),
+            "Claude Code usage request failed after retry (HTTP 429; retry-after 60s)"
+        );
+    }
+
+    #[test]
+    fn watch_retains_stale_claude_usage_only_for_temporary_failures() {
+        let previous = Snapshot {
+            schema_version: JSON_SCHEMA_VERSION,
+            fetched_at: 1_000,
+            providers: vec![ProviderUsage {
+                provider: Provider::ClaudeCode.name(),
+                status: UsageStatus::Ok,
+                available: true,
+                plan: Some("max".to_owned()),
+                source: Some("oauth"),
+                windows: vec![UsageWindow {
+                    label: "5h",
+                    status: UsageStatus::Ok,
+                    used_percent: Some(42.0),
+                    reset_at: Some(2_000),
+                    window_seconds: Some(18_000),
+                    limit_reached: None,
+                }],
+                error: None,
+                fetched_at: 1_000,
+            }],
+        };
+        let mut current = Snapshot {
+            schema_version: JSON_SCHEMA_VERSION,
+            fetched_at: 1_100,
+            providers: vec![unavailable(
+                Provider::ClaudeCode,
+                CLAUDE_CODE_TRANSIENT_ERROR,
+                1_100,
+            )],
+        };
+
+        retain_stale_claude_usage(&mut current, Some(&previous));
+
+        let stale = &current.providers[0];
+        assert!(stale.available);
+        assert_eq!(stale.status, UsageStatus::Unavailable);
+        assert_eq!(stale.windows[0].used_percent, Some(42.0));
+        assert_eq!(stale.fetched_at, 1_000);
+        assert_eq!(stale.error.as_deref(), Some(CLAUDE_CODE_TRANSIENT_ERROR));
+        assert!(render_dashboard(&current, false, default_layout(false)).contains("stale:"));
+
+        let mut rejected = Snapshot {
+            schema_version: JSON_SCHEMA_VERSION,
+            fetched_at: 1_100,
+            providers: vec![unavailable(
+                Provider::ClaudeCode,
+                "Claude Code OAuth credential was rejected",
+                1_100,
+            )],
+        };
+        retain_stale_claude_usage(&mut rejected, Some(&previous));
+        assert!(!rejected.providers[0].available);
+        assert!(rejected.providers[0].windows.is_empty());
     }
 
     #[test]
