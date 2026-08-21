@@ -1,6 +1,6 @@
 use std::{
     env,
-    fs::File,
+    fs::{self, File},
     io::{self, IsTerminal, Read, Write},
     path::{Path, PathBuf},
     thread,
@@ -16,8 +16,12 @@ use crossterm::{
     style::{Attribute, Color, Print, ResetColor, SetAttribute, SetForegroundColor},
     terminal::{Clear, ClearType, disable_raw_mode, enable_raw_mode, size},
 };
-use reqwest::blocking::Client;
-use serde::Serialize;
+use reqwest::{
+    StatusCode,
+    blocking::Client,
+    header::{HeaderValue, RETRY_AFTER},
+};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 const JSON_SCHEMA_VERSION: u8 = 1;
@@ -29,6 +33,11 @@ const COMPACT_WINDOW_WIDTH: usize = 3;
 const RESET_WIDTH: usize = "unavailable".len();
 const CODEX_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
 const CLAUDE_CODE_USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
+const CLAUDE_CODE_REQUEST_ERROR: &str = "Claude Code usage request failed";
+const CLAUDE_CODE_CACHE_SCHEMA_VERSION: u8 = 1;
+const CLAUDE_CODE_CACHE_MAX_AGE: u64 = 60 * 60;
+const CLAUDE_CODE_REFRESH_INTERVAL: u64 = 5 * 60;
+const CLAUDE_CODE_RATE_LIMIT_COOLDOWN: u64 = 15 * 60;
 const OPENCODE_GO_USAGE_URL: &str = "https://opencode.ai/zen/go/v1/usage";
 
 #[derive(Parser)]
@@ -102,7 +111,7 @@ impl Provider {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum UsageStatus {
     Ok,
@@ -110,14 +119,14 @@ enum UsageStatus {
     RateLimited,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 struct Snapshot {
     schema_version: u8,
     fetched_at: u64,
     providers: Vec<ProviderUsage>,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 struct ProviderUsage {
     provider: &'static str,
     status: UsageStatus,
@@ -128,13 +137,55 @@ struct ProviderUsage {
     source: Option<&'static str>,
     windows: Vec<UsageWindow>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    error: Option<&'static str>,
+    error: Option<String>,
     fetched_at: u64,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 struct UsageWindow {
     label: &'static str,
+    status: UsageStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    used_percent: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reset_at: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    window_seconds: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    limit_reached: Option<bool>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ClaudeCodeCooldown {
+    RateLimited,
+    Transient,
+}
+
+enum ClaudeCodeRequestError {
+    Authentication,
+    Retry {
+        delay: u64,
+        cooldown: ClaudeCodeCooldown,
+        message: String,
+    },
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+struct ClaudeCodeCache {
+    schema_version: u8,
+    fetched_at: u64,
+    refresh_after: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cooldown: Option<ClaudeCodeCooldown>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    plan: Option<String>,
+    windows: Vec<CachedUsageWindow>,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+struct CachedUsageWindow {
+    label: String,
     status: UsageStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
     used_percent: Option<f64>,
@@ -366,7 +417,7 @@ fn fetch_snapshot(requested: &[Provider]) -> Snapshot {
     }
 }
 
-fn unavailable(provider: Provider, error: &'static str, fetched_at: u64) -> ProviderUsage {
+fn unavailable(provider: Provider, error: impl Into<String>, fetched_at: u64) -> ProviderUsage {
     ProviderUsage {
         provider: provider.name(),
         status: UsageStatus::Unavailable,
@@ -374,7 +425,7 @@ fn unavailable(provider: Provider, error: &'static str, fetched_at: u64) -> Prov
         plan: None,
         source: None,
         windows: vec![],
-        error: Some(error),
+        error: Some(error.into()),
         fetched_at,
     }
 }
@@ -606,47 +657,58 @@ fn fetch_claude_code(client: &Client, fetched_at: u64) -> ProviderUsage {
             fetched_at,
         );
     };
-    let request = client
-        .get(CLAUDE_CODE_USAGE_URL)
-        .header("Accept", "application/json")
-        .header("anthropic-beta", "oauth-2025-04-20")
-        .bearer_auth(access_token);
-    let response = match request.send() {
-        Ok(response) if response.status().is_success() => response,
-        Ok(response) if response.status().as_u16() == 401 || response.status().as_u16() == 403 => {
+    let cache_path = claude_code_cache_path();
+    let cache = cache_path.as_deref().and_then(read_claude_code_cache);
+    if let Some(cache) = cache.as_ref()
+        && claude_code_cache_throttled(cache, fetched_at)
+    {
+        let remaining = cache.refresh_after - fetched_at;
+        let reason = match cache.cooldown {
+            Some(ClaudeCodeCooldown::RateLimited) => "Claude Code usage is rate limited",
+            Some(ClaudeCodeCooldown::Transient) => "Claude Code usage is temporarily unavailable",
+            None => "Claude Code usage refresh is throttled",
+        };
+        let error = format!("{reason}; retry in {}", short_duration(remaining));
+        return cached_claude_code_usage(cache, fetched_at, &error)
+            .unwrap_or_else(|| unavailable(Provider::ClaudeCode, error, fetched_at));
+    }
+
+    let data = match request_claude_code_usage(client, &access_token) {
+        Ok(data) => data,
+        Err(ClaudeCodeRequestError::Authentication) => {
             return unavailable(
                 Provider::ClaudeCode,
                 "Claude Code OAuth credential was rejected",
                 fetched_at,
             );
         }
-        Ok(_) | Err(_) => {
-            return unavailable(
-                Provider::ClaudeCode,
-                "Claude Code usage request failed",
+        Err(ClaudeCodeRequestError::Retry {
+            delay,
+            cooldown,
+            message,
+        }) => {
+            return failed_claude_code_refresh(
+                cache,
+                cache_path.as_deref(),
                 fetched_at,
-            );
-        }
-    };
-    let data: Value = match response.json() {
-        Ok(data) => data,
-        Err(_) => {
-            return unavailable(
-                Provider::ClaudeCode,
-                "Claude Code usage response was invalid",
-                fetched_at,
+                delay,
+                cooldown,
+                &message,
             );
         }
     };
     let windows = claude_code_windows(&data);
     if windows.is_empty() {
-        return unavailable(
-            Provider::ClaudeCode,
-            "Claude Code usage windows unavailable",
+        return failed_claude_code_refresh(
+            cache,
+            cache_path.as_deref(),
             fetched_at,
+            CLAUDE_CODE_REFRESH_INTERVAL,
+            ClaudeCodeCooldown::Transient,
+            "Claude Code usage windows unavailable",
         );
     }
-    ProviderUsage {
+    let usage = ProviderUsage {
         provider: Provider::ClaudeCode.name(),
         status: provider_status(&windows),
         available: true,
@@ -659,6 +721,214 @@ fn fetch_claude_code(client: &Client, fetched_at: u64) -> ProviderUsage {
         windows,
         error: None,
         fetched_at,
+    };
+    if let Some(path) = cache_path.as_deref() {
+        let cache = ClaudeCodeCache::from_usage(
+            &usage,
+            fetched_at.saturating_add(CLAUDE_CODE_REFRESH_INTERVAL),
+        );
+        let _ = write_claude_code_cache(path, &cache);
+    }
+    usage
+}
+
+fn request_claude_code_usage(
+    client: &Client,
+    access_token: &str,
+) -> Result<Value, ClaudeCodeRequestError> {
+    let response = client
+        .get(CLAUDE_CODE_USAGE_URL)
+        .header("Accept", "application/json")
+        .header("anthropic-beta", "oauth-2025-04-20")
+        .bearer_auth(access_token)
+        .send()
+        .map_err(|_| ClaudeCodeRequestError::Retry {
+            delay: CLAUDE_CODE_REFRESH_INTERVAL,
+            cooldown: ClaudeCodeCooldown::Transient,
+            message: CLAUDE_CODE_REQUEST_ERROR.to_owned(),
+        })?;
+    let status = response.status();
+    if claude_code_auth_failure(status) {
+        return Err(ClaudeCodeRequestError::Authentication);
+    }
+    if status == StatusCode::TOO_MANY_REQUESTS {
+        let delay = claude_code_retry_after(response.headers().get(RETRY_AFTER), Utc::now())
+            .unwrap_or(CLAUDE_CODE_RATE_LIMIT_COOLDOWN)
+            .max(60);
+        return Err(ClaudeCodeRequestError::Retry {
+            delay,
+            cooldown: ClaudeCodeCooldown::RateLimited,
+            message: "Claude Code usage is rate limited (HTTP 429)".to_owned(),
+        });
+    }
+    if !status.is_success() {
+        return Err(ClaudeCodeRequestError::Retry {
+            delay: CLAUDE_CODE_REFRESH_INTERVAL,
+            cooldown: ClaudeCodeCooldown::Transient,
+            message: format!("{CLAUDE_CODE_REQUEST_ERROR} (HTTP {})", status.as_u16()),
+        });
+    }
+    response.json().map_err(|_| ClaudeCodeRequestError::Retry {
+        delay: CLAUDE_CODE_REFRESH_INTERVAL,
+        cooldown: ClaudeCodeCooldown::Transient,
+        message: "Claude Code usage response was invalid".to_owned(),
+    })
+}
+
+impl ClaudeCodeCache {
+    fn empty() -> Self {
+        Self {
+            schema_version: CLAUDE_CODE_CACHE_SCHEMA_VERSION,
+            fetched_at: 0,
+            refresh_after: 0,
+            cooldown: None,
+            plan: None,
+            windows: Vec::new(),
+        }
+    }
+
+    fn from_usage(usage: &ProviderUsage, refresh_after: u64) -> Self {
+        Self {
+            schema_version: CLAUDE_CODE_CACHE_SCHEMA_VERSION,
+            fetched_at: usage.fetched_at,
+            refresh_after,
+            cooldown: None,
+            plan: usage.plan.clone(),
+            windows: usage
+                .windows
+                .iter()
+                .map(|window| CachedUsageWindow {
+                    label: window.label.to_owned(),
+                    status: window.status,
+                    used_percent: window.used_percent,
+                    reset_at: window.reset_at,
+                    window_seconds: window.window_seconds,
+                    limit_reached: window.limit_reached,
+                })
+                .collect(),
+        }
+    }
+}
+
+fn claude_code_auth_failure(status: StatusCode) -> bool {
+    status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN
+}
+
+fn claude_code_cache_throttled(cache: &ClaudeCodeCache, now: u64) -> bool {
+    cache.refresh_after > now
+}
+
+fn failed_claude_code_refresh(
+    cache: Option<ClaudeCodeCache>,
+    cache_path: Option<&Path>,
+    fetched_at: u64,
+    retry_after: u64,
+    cooldown: ClaudeCodeCooldown,
+    error: &str,
+) -> ProviderUsage {
+    let mut cache = cache.unwrap_or_else(ClaudeCodeCache::empty);
+    cache.refresh_after = fetched_at.saturating_add(retry_after);
+    cache.cooldown = Some(cooldown);
+    if let Some(path) = cache_path {
+        let _ = write_claude_code_cache(path, &cache);
+    }
+    let error = format!("{error}; retry in {}", short_duration(retry_after));
+    cached_claude_code_usage(&cache, fetched_at, &error)
+        .unwrap_or_else(|| unavailable(Provider::ClaudeCode, error, fetched_at))
+}
+
+fn cached_claude_code_usage(
+    cache: &ClaudeCodeCache,
+    now: u64,
+    error: &str,
+) -> Option<ProviderUsage> {
+    let age = now.saturating_sub(cache.fetched_at);
+    if cache.windows.is_empty() || age > CLAUDE_CODE_CACHE_MAX_AGE {
+        return None;
+    }
+    let windows = cache
+        .windows
+        .iter()
+        .filter_map(|window| {
+            let label = match window.label.as_str() {
+                "5h" => "5h",
+                "7d" => "7d",
+                _ => return None,
+            };
+            Some(UsageWindow {
+                label,
+                status: window.status,
+                used_percent: window.used_percent,
+                reset_at: window.reset_at,
+                window_seconds: window.window_seconds,
+                limit_reached: window.limit_reached,
+            })
+        })
+        .collect::<Vec<_>>();
+    if windows.is_empty() {
+        return None;
+    }
+    Some(ProviderUsage {
+        provider: Provider::ClaudeCode.name(),
+        status: UsageStatus::Unavailable,
+        available: true,
+        plan: cache.plan.clone(),
+        source: Some("oauth"),
+        windows,
+        error: Some(format!(
+            "{error}; cached data is {} old",
+            short_duration(age)
+        )),
+        fetched_at: cache.fetched_at,
+    })
+}
+
+fn claude_code_cache_path() -> Option<PathBuf> {
+    env::var_os("XDG_CACHE_HOME")
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| home_dir().map(|home| home.join(".cache")))
+        .map(|root| root.join("llm-usage/claude-code.json"))
+}
+
+fn read_claude_code_cache(path: &Path) -> Option<ClaudeCodeCache> {
+    let cache = serde_json::from_reader::<_, ClaudeCodeCache>(File::open(path).ok()?).ok()?;
+    (cache.schema_version == CLAUDE_CODE_CACHE_SCHEMA_VERSION).then_some(cache)
+}
+
+fn write_claude_code_cache(path: &Path, cache: &ClaudeCodeCache) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let temporary = path.with_extension(format!("json.tmp-{}", std::process::id()));
+    fs::write(
+        &temporary,
+        serde_json::to_vec(cache).map_err(io::Error::other)?,
+    )?;
+    fs::rename(temporary, path)
+}
+
+fn claude_code_retry_after(value: Option<&HeaderValue>, now: DateTime<Utc>) -> Option<u64> {
+    let value = value?.to_str().ok()?;
+    if let Ok(seconds) = value.parse() {
+        return Some(seconds);
+    }
+    let retry_at = DateTime::parse_from_rfc2822(value)
+        .ok()?
+        .with_timezone(&Utc);
+    u64::try_from((retry_at - now).num_seconds().max(0)).ok()
+}
+
+fn short_duration(seconds: u64) -> String {
+    if seconds < 60 {
+        return format!("{seconds}s");
+    }
+    let minutes = seconds / 60;
+    let seconds = seconds % 60;
+    if seconds == 0 {
+        format!("{minutes}m")
+    } else {
+        format!("{minutes}m {seconds}s")
     }
 }
 
@@ -975,13 +1245,13 @@ fn render_dashboard_with_hint(
                 lines.push(format!(" {label}"));
                 lines.push(format!(
                     "   unavailable: {}",
-                    provider.error.unwrap_or("usage unavailable")
+                    provider.error.as_deref().unwrap_or("usage unavailable")
                 ));
             } else {
                 lines.push(format!(
                     " {:<PROVIDER_WIDTH$} unavailable: {}",
                     label,
-                    provider.error.unwrap_or("usage unavailable")
+                    provider.error.as_deref().unwrap_or("usage unavailable")
                 ));
             }
             continue;
@@ -999,6 +1269,14 @@ fn render_dashboard_with_hint(
         }
         if compact {
             lines.push(format!(" {label}"));
+        }
+        if provider.status == UsageStatus::Unavailable {
+            let error = provider.error.as_deref().unwrap_or("usage unavailable");
+            if compact {
+                lines.push(format!("   stale: {error}"));
+            } else {
+                lines.push(format!(" {label:<PROVIDER_WIDTH$} stale: {error}"));
+            }
         }
         for window in &provider.windows {
             let Some(used_percent) = window.used_percent else {
@@ -1289,6 +1567,109 @@ mod tests {
             fetched_at: 1_000,
             providers: Vec::new(),
         }
+    }
+
+    fn sample_claude_usage(fetched_at: u64) -> ProviderUsage {
+        ProviderUsage {
+            provider: Provider::ClaudeCode.name(),
+            status: UsageStatus::Ok,
+            available: true,
+            plan: Some("max".to_owned()),
+            source: Some("oauth"),
+            windows: vec![UsageWindow {
+                label: "5h",
+                status: UsageStatus::Ok,
+                used_percent: Some(42.0),
+                reset_at: Some(2_000),
+                window_seconds: Some(18_000),
+                limit_reached: None,
+            }],
+            error: None,
+            fetched_at,
+        }
+    }
+
+    #[test]
+    fn claude_code_cache_is_durable_sanitized_and_expires_after_one_hour() {
+        let path = env::temp_dir().join(format!(
+            "llm-usage-claude-cache-test-{}.json",
+            std::process::id()
+        ));
+        let cache = ClaudeCodeCache::from_usage(&sample_claude_usage(1_000), 1_300);
+
+        write_claude_code_cache(&path, &cache).unwrap();
+        let loaded = read_claude_code_cache(&path).unwrap();
+        let serialized = fs::read_to_string(&path).unwrap();
+        fs::remove_file(path).unwrap();
+
+        assert!(cached_claude_code_usage(&loaded, 4_600, "stale").is_some());
+        assert!(cached_claude_code_usage(&loaded, 4_601, "stale").is_none());
+        assert!(!serialized.contains("access_token"));
+        assert!(!serialized.contains("response"));
+        assert!(!serialized.contains("oauth-token"));
+    }
+
+    #[test]
+    fn claude_code_cache_throttles_refreshes_and_persists_rate_limit_cooldown() {
+        let path = env::temp_dir().join(format!(
+            "llm-usage-claude-rate-limit-test-{}.json",
+            std::process::id()
+        ));
+        let cache = ClaudeCodeCache::from_usage(&sample_claude_usage(1_000), 1_300);
+        assert!(claude_code_cache_throttled(&cache, 1_030));
+        assert!(!claude_code_cache_throttled(&cache, 1_300));
+
+        let stale = failed_claude_code_refresh(
+            Some(cache),
+            Some(&path),
+            1_100,
+            CLAUDE_CODE_RATE_LIMIT_COOLDOWN,
+            ClaudeCodeCooldown::RateLimited,
+            "Claude Code usage is rate limited (HTTP 429)",
+        );
+        let persisted = read_claude_code_cache(&path).unwrap();
+        fs::remove_file(path).unwrap();
+
+        assert_eq!(persisted.refresh_after, 2_000);
+        assert_eq!(persisted.cooldown, Some(ClaudeCodeCooldown::RateLimited));
+        assert!(stale.available);
+        assert_eq!(stale.status, UsageStatus::Unavailable);
+        assert_eq!(stale.fetched_at, 1_000);
+        assert!(
+            stale
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("retry in 15m") && error.contains("1m 40s old"))
+        );
+
+        let retry_after = HeaderValue::from_static("60");
+        assert_eq!(
+            claude_code_retry_after(Some(&retry_after), Utc::now()),
+            Some(60)
+        );
+    }
+
+    #[test]
+    fn cached_claude_code_usage_renders_stale_age() {
+        let cache = ClaudeCodeCache::from_usage(&sample_claude_usage(1_000), 1_300);
+        let stale = cached_claude_code_usage(&cache, 1_100, "refresh throttled").unwrap();
+        let snapshot = Snapshot {
+            schema_version: JSON_SCHEMA_VERSION,
+            fetched_at: 1_100,
+            providers: vec![stale],
+        };
+        let dashboard = render_dashboard(&snapshot, false, default_layout(false));
+
+        assert!(dashboard.contains("stale:"));
+        assert!(dashboard.contains("cached data is 1m 40s old"));
+    }
+
+    #[test]
+    fn claude_code_auth_failures_remain_distinct() {
+        assert!(claude_code_auth_failure(StatusCode::UNAUTHORIZED));
+        assert!(claude_code_auth_failure(StatusCode::FORBIDDEN));
+        assert!(!claude_code_auth_failure(StatusCode::TOO_MANY_REQUESTS));
+        assert!(!claude_code_auth_failure(StatusCode::BAD_GATEWAY));
     }
 
     #[test]
