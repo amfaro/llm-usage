@@ -39,10 +39,10 @@ Claude Code authentication mirrors the Codex lookup order, but uses a Claude Cod
    `Claude Code-credentials` (enumerated via `security`; the freshest
    unexpired token wins).
 
-The token is sent as a `Bearer` token to Anthropic's internal OAuth usage endpoint. If the endpoint returns rate limits or rejects the token (for example, when using an `ANTHROPIC_API_KEY` instead of an OAuth session), the dashboard shows an `unavailable` row with a clear message.
+The token is sent as a `Bearer` token to Anthropic's internal OAuth usage endpoint. Rejected credentials (for example, an `ANTHROPIC_API_KEY` instead of an OAuth session) remain unavailable with a clear message.
 
 > [!NOTE]
-> The Claude Code usage endpoint is undocumented and may change or rate-limit aggressively. Retryable failures are retried once with a bounded delay. In `watch` mode, a failed refresh keeps the last successful windows visible and marks the provider `stale`; authentication failures remain unavailable.
+> The Claude Code usage endpoint is undocumented and may change or rate-limit aggressively. Successful usage is cached without credentials or response bodies under `$XDG_CACHE_HOME/llm-usage` (or `~/.cache/llm-usage`) and refreshed at most every five minutes. Rate limits pause requests for `Retry-After` or 15 minutes by default. Retryable failures keep cached windows visible with a stale age for at most 60 minutes; authentication failures never use stale data.
 
 ### OpenCode Go
 
