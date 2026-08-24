@@ -156,6 +156,51 @@ struct UsageWindow {
     limit_reached: Option<bool>,
 }
 
+/// Serialized view of a [`Snapshot`] with derived quota state added.
+///
+/// Every raw provider field is preserved; `display` and `best_available` are
+/// additive conveniences so consumers do not reimplement quota semantics.
+#[derive(Serialize)]
+struct SnapshotView<'a> {
+    schema_version: u8,
+    fetched_at: u64,
+    providers: Vec<ProviderView<'a>>,
+    best_available: Option<BestAvailable>,
+}
+
+#[derive(Serialize)]
+struct ProviderView<'a> {
+    #[serde(flatten)]
+    usage: &'a ProviderUsage,
+    display: ProviderDisplay,
+}
+
+#[derive(Serialize)]
+struct ProviderDisplay {
+    name: &'static str,
+    exhausted: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    capacity_used_percent: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    limiting_window: Option<DisplayWindow>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    next_reset_at: Option<u64>,
+}
+
+#[derive(Serialize)]
+struct DisplayWindow {
+    label: &'static str,
+    used_percent: u8,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reset_at: Option<u64>,
+}
+
+#[derive(Clone, Copy, Serialize)]
+struct BestAvailable {
+    provider: &'static str,
+    capacity_used_percent: u8,
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum ClaudeCodeCooldown {
@@ -353,7 +398,7 @@ fn print_json(args: &QueryArgs) -> i32 {
     let snapshot = fetch_snapshot(&args.providers);
     println!(
         "{}",
-        serde_json::to_string_pretty(&snapshot).expect("snapshot serializes")
+        serde_json::to_string_pretty(&snapshot_view(&snapshot)).expect("snapshot serializes")
     );
     exit_code(&snapshot)
 }
@@ -1201,6 +1246,118 @@ fn provider_status(windows: &[UsageWindow]) -> UsageStatus {
     }
 }
 
+fn provider_label(provider: &'static str) -> &'static str {
+    match provider {
+        "codex" => Provider::Codex.label(),
+        "opencode-go" => Provider::OpencodeGo.label(),
+        "claude-code" => Provider::ClaudeCode.label(),
+        other => other,
+    }
+}
+
+/// Adds derived quota state to a snapshot without changing any raw field.
+fn snapshot_view(snapshot: &Snapshot) -> SnapshotView<'_> {
+    let providers: Vec<ProviderView<'_>> = snapshot
+        .providers
+        .iter()
+        .map(|usage| ProviderView {
+            display: provider_display(usage),
+            usage,
+        })
+        .collect();
+
+    SnapshotView {
+        schema_version: snapshot.schema_version,
+        fetched_at: snapshot.fetched_at,
+        best_available: best_available(&providers),
+        providers,
+    }
+}
+
+fn provider_display(usage: &ProviderUsage) -> ProviderDisplay {
+    let exhausted = usage.status == UsageStatus::RateLimited;
+    let limiting = limiting_window(&usage.windows);
+    let capacity_used_percent = if usage.status == UsageStatus::Unavailable {
+        None
+    } else if exhausted {
+        Some(100)
+    } else {
+        limiting.map(|window| rounded_percent(window.used_percent.unwrap_or_default()))
+    };
+
+    ProviderDisplay {
+        name: provider_label(usage.provider),
+        exhausted,
+        capacity_used_percent,
+        limiting_window: limiting.map(|window| DisplayWindow {
+            label: window.label,
+            used_percent: rounded_percent(window.used_percent.unwrap_or_default()),
+            reset_at: window.reset_at,
+        }),
+        next_reset_at: next_reset_at(&usage.windows),
+    }
+}
+
+/// Picks the window that constrains a provider: a rate-limited window first,
+/// then the highest usage. Ties keep response order, so the shortest window
+/// wins because providers list windows shortest first.
+fn limiting_window(windows: &[UsageWindow]) -> Option<&UsageWindow> {
+    fn rank(window: &UsageWindow) -> (bool, f64) {
+        (
+            window.status == UsageStatus::RateLimited,
+            window.used_percent.unwrap_or_default(),
+        )
+    }
+
+    let mut limiting: Option<&UsageWindow> = None;
+    for window in windows
+        .iter()
+        .filter(|window| window.status != UsageStatus::Unavailable)
+        .filter(|window| window.used_percent.is_some())
+    {
+        limiting = match limiting {
+            Some(current) if rank(current) >= rank(window) => Some(current),
+            _ => Some(window),
+        };
+    }
+    limiting
+}
+
+/// Soonest reset among windows that report one, ignoring unavailable windows.
+fn next_reset_at(windows: &[UsageWindow]) -> Option<u64> {
+    windows
+        .iter()
+        .filter(|window| window.status != UsageStatus::Unavailable)
+        .filter_map(|window| window.reset_at)
+        .min()
+}
+
+/// Lowest-usage provider that is not unavailable. Providers without a
+/// comparable capacity (no usable window) are skipped, and ties keep snapshot
+/// order.
+fn best_available(providers: &[ProviderView<'_>]) -> Option<BestAvailable> {
+    let mut best: Option<BestAvailable> = None;
+    for view in providers {
+        if view.usage.status == UsageStatus::Unavailable {
+            continue;
+        }
+        let Some(capacity_used_percent) = view.display.capacity_used_percent else {
+            continue;
+        };
+        let candidate = BestAvailable {
+            provider: view.usage.provider,
+            capacity_used_percent,
+        };
+        best = match best {
+            Some(current) if current.capacity_used_percent <= capacity_used_percent => {
+                Some(current)
+            }
+            _ => Some(candidate),
+        };
+    }
+    best
+}
+
 fn dashboard_reset_width(snapshot: &Snapshot) -> usize {
     snapshot
         .providers
@@ -1235,12 +1392,7 @@ fn render_dashboard_with_hint(
         if index > 0 {
             lines.push(provider_separator(colors, reset_width, compact, bar_width));
         }
-        let label = match provider.provider {
-            "codex" => Provider::Codex.label(),
-            "opencode-go" => Provider::OpencodeGo.label(),
-            "claude-code" => Provider::ClaudeCode.label(),
-            _ => provider.provider,
-        };
+        let label = provider_label(provider.provider);
         if !provider.available {
             if compact {
                 lines.push(format!(" {label}"));
@@ -1854,6 +2006,201 @@ mod tests {
         assert_eq!(json["providers"][0]["windows"][1]["status"], "unavailable");
         assert!(json["providers"][0]["windows"][1]["used_percent"].is_null());
         assert_eq!(json["providers"][1]["status"], "unavailable");
+    }
+
+    fn sample_window(
+        label: &'static str,
+        status: UsageStatus,
+        used_percent: f64,
+        reset_at: u64,
+    ) -> UsageWindow {
+        UsageWindow {
+            label,
+            status,
+            used_percent: Some(used_percent),
+            reset_at: Some(reset_at),
+            window_seconds: Some(18_000),
+            limit_reached: Some(status == UsageStatus::RateLimited),
+        }
+    }
+
+    fn sample_provider(
+        provider: &'static str,
+        status: UsageStatus,
+        windows: Vec<UsageWindow>,
+    ) -> ProviderUsage {
+        ProviderUsage {
+            provider,
+            status,
+            available: status != UsageStatus::Unavailable,
+            plan: None,
+            source: Some("oauth"),
+            windows,
+            error: None,
+            fetched_at: 1_000,
+        }
+    }
+
+    fn derived_json(providers: Vec<ProviderUsage>) -> serde_json::Value {
+        let snapshot = Snapshot {
+            schema_version: JSON_SCHEMA_VERSION,
+            fetched_at: 1_000,
+            providers,
+        };
+        serde_json::to_value(snapshot_view(&snapshot)).unwrap()
+    }
+
+    #[test]
+    fn derived_display_keeps_raw_fields_and_adds_capacity() {
+        let json = derived_json(vec![sample_provider(
+            "codex",
+            UsageStatus::Ok,
+            vec![
+                sample_window("5h", UsageStatus::Ok, 41.6, 2_000),
+                sample_window("7d", UsageStatus::Ok, 10.0, 9_000),
+            ],
+        )]);
+        let provider = &json["providers"][0];
+
+        assert_eq!(json["schema_version"], 2);
+        assert_eq!(provider["status"], "ok");
+        assert_eq!(provider["windows"][0]["used_percent"], 41.6);
+        assert_eq!(provider["display"]["name"], "Codex");
+        assert_eq!(provider["display"]["exhausted"], false);
+        assert_eq!(provider["display"]["capacity_used_percent"], 42);
+        assert_eq!(provider["display"]["limiting_window"]["label"], "5h");
+        assert_eq!(provider["display"]["limiting_window"]["used_percent"], 42);
+        assert_eq!(provider["display"]["limiting_window"]["reset_at"], 2_000);
+        assert_eq!(provider["display"]["next_reset_at"], 2_000);
+        assert_eq!(json["best_available"]["provider"], "codex");
+        assert_eq!(json["best_available"]["capacity_used_percent"], 42);
+    }
+
+    #[test]
+    fn rate_limited_provider_is_exhausted_at_full_capacity() {
+        let json = derived_json(vec![sample_provider(
+            "opencode-go",
+            UsageStatus::RateLimited,
+            vec![
+                sample_window("5h", UsageStatus::Ok, 96.0, 2_000),
+                sample_window("7d", UsageStatus::RateLimited, 95.0, 9_000),
+            ],
+        )]);
+        let display = &json["providers"][0]["display"];
+
+        assert_eq!(display["exhausted"], true);
+        assert_eq!(display["capacity_used_percent"], 100);
+        assert_eq!(display["limiting_window"]["label"], "7d");
+        assert_eq!(display["limiting_window"]["used_percent"], 95);
+        assert_eq!(display["next_reset_at"], 2_000);
+        assert_eq!(json["best_available"]["provider"], "opencode-go");
+        assert_eq!(json["best_available"]["capacity_used_percent"], 100);
+    }
+
+    #[test]
+    fn unavailable_provider_has_no_derived_capacity() {
+        let json = derived_json(vec![unavailable(
+            Provider::Codex,
+            "credentials missing",
+            1_000,
+        )]);
+        let display = &json["providers"][0]["display"];
+
+        assert_eq!(json["providers"][0]["status"], "unavailable");
+        assert_eq!(display["name"], "Codex");
+        assert_eq!(display["exhausted"], false);
+        assert!(display["capacity_used_percent"].is_null());
+        assert!(display["limiting_window"].is_null());
+        assert!(display["next_reset_at"].is_null());
+        assert!(json["best_available"].is_null());
+    }
+
+    #[test]
+    fn stale_provider_stays_usable_and_ignores_unavailable_windows() {
+        let json = derived_json(vec![sample_provider(
+            "claude-code",
+            UsageStatus::Stale,
+            vec![
+                unavailable_window("5h"),
+                sample_window("7d", UsageStatus::Ok, 55.4, 9_000),
+            ],
+        )]);
+        let display = &json["providers"][0]["display"];
+
+        assert_eq!(display["exhausted"], false);
+        assert_eq!(display["capacity_used_percent"], 55);
+        assert_eq!(display["limiting_window"]["label"], "7d");
+        assert_eq!(display["next_reset_at"], 9_000);
+        assert_eq!(json["best_available"]["provider"], "claude-code");
+    }
+
+    #[test]
+    fn provider_without_usable_windows_is_not_comparable() {
+        let json = derived_json(vec![
+            sample_provider("codex", UsageStatus::Ok, vec![]),
+            sample_provider(
+                "opencode-go",
+                UsageStatus::Ok,
+                vec![unavailable_window("5h")],
+            ),
+        ]);
+
+        assert!(json["providers"][0]["display"]["capacity_used_percent"].is_null());
+        assert!(json["providers"][1]["display"]["capacity_used_percent"].is_null());
+        assert!(json["best_available"].is_null());
+    }
+
+    #[test]
+    fn best_available_picks_lowest_capacity_across_providers() {
+        let json = derived_json(vec![
+            sample_provider(
+                "codex",
+                UsageStatus::Ok,
+                vec![sample_window("5h", UsageStatus::Ok, 80.0, 2_000)],
+            ),
+            sample_provider(
+                "opencode-go",
+                UsageStatus::RateLimited,
+                vec![sample_window("5h", UsageStatus::RateLimited, 100.0, 3_000)],
+            ),
+            sample_provider(
+                "claude-code",
+                UsageStatus::Stale,
+                vec![sample_window("5h", UsageStatus::Ok, 55.0, 4_000)],
+            ),
+            unavailable(Provider::Codex, "credentials missing", 1_000),
+        ]);
+
+        assert_eq!(json["providers"].as_array().unwrap().len(), 4);
+        assert_eq!(json["best_available"]["provider"], "claude-code");
+        assert_eq!(json["best_available"]["capacity_used_percent"], 55);
+    }
+
+    #[test]
+    fn ties_keep_response_and_snapshot_order() {
+        let json = derived_json(vec![
+            sample_provider(
+                "codex",
+                UsageStatus::Ok,
+                vec![
+                    sample_window("5h", UsageStatus::Ok, 42.0, 4_000),
+                    sample_window("7d", UsageStatus::Ok, 42.0, 2_000),
+                ],
+            ),
+            sample_provider(
+                "opencode-go",
+                UsageStatus::Ok,
+                vec![sample_window("5h", UsageStatus::Ok, 42.0, 3_000)],
+            ),
+        ]);
+
+        assert_eq!(
+            json["providers"][0]["display"]["limiting_window"]["label"],
+            "5h"
+        );
+        assert_eq!(json["providers"][0]["display"]["next_reset_at"], 2_000);
+        assert_eq!(json["best_available"]["provider"], "codex");
+        assert_eq!(json["best_available"]["capacity_used_percent"], 42);
     }
 
     #[test]
