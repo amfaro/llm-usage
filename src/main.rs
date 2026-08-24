@@ -7,7 +7,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Local, Utc};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use crossterm::{
     cursor::{MoveTo, RestorePosition, SavePosition},
@@ -31,6 +31,8 @@ const PROVIDER_WIDTH: usize = 11;
 const WINDOW_WIDTH: usize = 6;
 const COMPACT_WINDOW_WIDTH: usize = 3;
 const RESET_WIDTH: usize = "unavailable".len();
+const WARNING_PERCENT: u8 = 70;
+const CRITICAL_PERCENT: u8 = 90;
 const CODEX_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
 const CLAUDE_CODE_USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
 const CLAUDE_CODE_REQUEST_ERROR: &str = "Claude Code usage request failed";
@@ -166,6 +168,7 @@ struct SnapshotView<'a> {
     fetched_at: u64,
     providers: Vec<ProviderView<'a>>,
     best_available: Option<BestAvailable>,
+    presentation: Presentation,
 }
 
 #[derive(Serialize)]
@@ -199,6 +202,32 @@ struct DisplayWindow {
 struct BestAvailable {
     provider: &'static str,
     capacity_used_percent: u8,
+}
+
+/// Compact human-facing status text for any widget or dashboard. It carries no
+/// colors, no markup, and no shell; consumers style it themselves.
+#[derive(Serialize)]
+struct Presentation {
+    summary: String,
+    severity: Severity,
+    providers: Vec<ProviderPresentation>,
+    freshness: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum Severity {
+    Ok,
+    Warning,
+    Critical,
+    Unknown,
+}
+
+#[derive(Serialize)]
+struct ProviderPresentation {
+    provider: &'static str,
+    label: String,
+    visible: bool,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1266,10 +1295,12 @@ fn snapshot_view(snapshot: &Snapshot) -> SnapshotView<'_> {
         })
         .collect();
 
+    let best_available = best_available(&providers);
     SnapshotView {
         schema_version: snapshot.schema_version,
         fetched_at: snapshot.fetched_at,
-        best_available: best_available(&providers),
+        presentation: presentation(&providers, best_available, snapshot.fetched_at),
+        best_available,
         providers,
     }
 }
@@ -1356,6 +1387,129 @@ fn best_available(providers: &[ProviderView<'_>]) -> Option<BestAvailable> {
         };
     }
     best
+}
+
+/// Builds compact status text for widgets. Severity stays semantic and every
+/// raw and derived value remains available alongside it.
+fn presentation(
+    providers: &[ProviderView<'_>],
+    best: Option<BestAvailable>,
+    fetched_at: u64,
+) -> Presentation {
+    let summary = providers
+        .iter()
+        .filter(|view| presentation_visible(view))
+        .map(|view| {
+            format!(
+                "{} {}",
+                view.display.name,
+                presentation_status(view, fetched_at)
+            )
+        })
+        .collect::<Vec<String>>()
+        .join(" · ");
+
+    Presentation {
+        summary: if summary.is_empty() {
+            "no usage data".to_owned()
+        } else {
+            summary
+        },
+        severity: severity(best),
+        providers: providers
+            .iter()
+            .map(|view| ProviderPresentation {
+                provider: view.usage.provider,
+                label: format!(
+                    "{:<PROVIDER_WIDTH$} {}",
+                    view.display.name,
+                    presentation_status(view, fetched_at)
+                ),
+                visible: presentation_visible(view),
+            })
+            .collect(),
+        freshness: freshness_text(&local_clock(fetched_at)),
+    }
+}
+
+/// Compact status for one provider: `42% 5h ↻3h`, `unavailable`, or
+/// `no usage data`.
+fn presentation_status(view: &ProviderView<'_>, fetched_at: u64) -> String {
+    if view.usage.status == UsageStatus::Unavailable {
+        return "unavailable".to_owned();
+    }
+    let Some(percent) = view.display.capacity_used_percent else {
+        return "no usage data".to_owned();
+    };
+
+    let window = view
+        .display
+        .limiting_window
+        .as_ref()
+        .map_or_else(String::new, |window| {
+            let reset = window.reset_at.map_or_else(String::new, |reset_at| {
+                format!(" ↻{}", compact_reset(reset_at, fetched_at))
+            });
+            format!(" {}{reset}", window.label)
+        });
+    let stale = if view.usage.status == UsageStatus::Stale {
+        " (stale)"
+    } else {
+        ""
+    };
+
+    format!("{percent}%{window}{stale}")
+}
+
+/// A provider is worth showing in a compact widget once it reports usable
+/// capacity. Fuller UIs can still render every entry.
+fn presentation_visible(view: &ProviderView<'_>) -> bool {
+    view.usage.status != UsageStatus::Unavailable && view.display.capacity_used_percent.is_some()
+}
+
+/// Semantic severity of the best available provider, using the same
+/// thresholds as the terminal dashboard colors. Consumers choose colors.
+fn severity(best: Option<BestAvailable>) -> Severity {
+    match best {
+        None => Severity::Unknown,
+        Some(best) if best.capacity_used_percent >= CRITICAL_PERCENT => Severity::Critical,
+        Some(best) if best.capacity_used_percent >= WARNING_PERCENT => Severity::Warning,
+        Some(_) => Severity::Ok,
+    }
+}
+
+/// Largest whole unit only, so status text stays short: `7d`, `3h`, `12m`.
+fn compact_reset(reset_at: u64, now: u64) -> String {
+    let seconds = reset_at.saturating_sub(now);
+    if seconds == 0 {
+        return "now".to_owned();
+    }
+    let days = seconds / 86_400;
+    let hours = seconds / 3_600;
+    let minutes = seconds / 60;
+    if days > 0 {
+        format!("{days}d")
+    } else if hours > 0 {
+        format!("{hours}h")
+    } else if minutes > 0 {
+        format!("{minutes}m")
+    } else {
+        format!("{seconds}s")
+    }
+}
+
+fn freshness_text(clock: &str) -> String {
+    format!("Updated {clock} · ↻ = reset in")
+}
+
+fn local_clock(timestamp: u64) -> String {
+    i64::try_from(timestamp)
+        .ok()
+        .and_then(|seconds| DateTime::from_timestamp(seconds, 0))
+        .map_or_else(
+            || "unknown".to_owned(),
+            |utc| utc.with_timezone(&Local).format("%H:%M:%S").to_string(),
+        )
 }
 
 fn dashboard_reset_width(snapshot: &Snapshot) -> usize {
@@ -1649,9 +1803,9 @@ fn usage_bar(percent: u8, width: usize) -> String {
 }
 
 fn usage_color(percent: u8) -> Color {
-    if percent >= 90 {
+    if percent >= CRITICAL_PERCENT {
         Color::DarkRed
-    } else if percent >= 70 {
+    } else if percent >= WARNING_PERCENT {
         Color::DarkYellow
     } else {
         Color::DarkGreen
@@ -1659,9 +1813,9 @@ fn usage_color(percent: u8) -> Color {
 }
 
 fn unused_color(percent: u8) -> Color {
-    if percent >= 90 {
+    if percent >= CRITICAL_PERCENT {
         Color::Red
-    } else if percent >= 70 {
+    } else if percent >= WARNING_PERCENT {
         Color::Yellow
     } else {
         Color::Green
@@ -2174,6 +2328,30 @@ mod tests {
         assert_eq!(json["providers"].as_array().unwrap().len(), 4);
         assert_eq!(json["best_available"]["provider"], "claude-code");
         assert_eq!(json["best_available"]["capacity_used_percent"], 55);
+        assert_eq!(json["presentation"]["severity"], "ok");
+    }
+
+    #[test]
+    fn severity_is_critical_only_when_no_provider_has_room() {
+        let exhausted = |provider| {
+            sample_provider(
+                provider,
+                UsageStatus::RateLimited,
+                vec![sample_window("5h", UsageStatus::RateLimited, 100.0, 2_000)],
+            )
+        };
+        let json = derived_json(vec![
+            exhausted("codex"),
+            exhausted("opencode-go"),
+            unavailable(Provider::ClaudeCode, "credentials missing", 1_000),
+        ]);
+
+        assert_eq!(json["best_available"]["capacity_used_percent"], 100);
+        assert_eq!(json["presentation"]["severity"], "critical");
+        assert_eq!(
+            json["presentation"]["summary"],
+            "Codex 100% 5h ↻16m · OpenCode Go 100% 5h ↻16m"
+        );
     }
 
     #[test]
@@ -2201,6 +2379,116 @@ mod tests {
         assert_eq!(json["providers"][0]["display"]["next_reset_at"], 2_000);
         assert_eq!(json["best_available"]["provider"], "codex");
         assert_eq!(json["best_available"]["capacity_used_percent"], 42);
+    }
+
+    #[test]
+    fn presentation_summarizes_visible_providers_without_styling() {
+        let json = derived_json(vec![
+            sample_provider(
+                "codex",
+                UsageStatus::Ok,
+                vec![sample_window("5h", UsageStatus::Ok, 42.0, 1_000 + 7_200)],
+            ),
+            sample_provider(
+                "claude-code",
+                UsageStatus::Stale,
+                vec![sample_window("7d", UsageStatus::Ok, 35.0, 1_000 + 259_200)],
+            ),
+        ]);
+        let presentation = &json["presentation"];
+
+        assert_eq!(
+            presentation["summary"],
+            "Codex 42% 5h ↻2h · Claude Code 35% 7d ↻3d (stale)"
+        );
+        assert_eq!(presentation["severity"], "ok");
+        assert_eq!(presentation["providers"][0]["provider"], "codex");
+        assert_eq!(
+            presentation["providers"][0]["label"],
+            "Codex       42% 5h ↻2h"
+        );
+        assert_eq!(presentation["providers"][0]["visible"], true);
+        assert_eq!(
+            presentation["providers"][1]["label"],
+            "Claude Code 35% 7d ↻3d (stale)"
+        );
+        assert_eq!(
+            presentation["freshness"],
+            freshness_text(&local_clock(1_000))
+        );
+        assert!(
+            presentation["freshness"]
+                .as_str()
+                .is_some_and(|text| text.contains("↻ = reset in"))
+        );
+    }
+
+    #[test]
+    fn presentation_marks_providers_without_capacity_as_not_visible() {
+        let json = derived_json(vec![
+            unavailable(Provider::Codex, "credentials missing", 1_000),
+            sample_provider("opencode-go", UsageStatus::Ok, vec![]),
+        ]);
+        let presentation = &json["presentation"];
+
+        assert_eq!(presentation["summary"], "no usage data");
+        assert_eq!(presentation["severity"], "unknown");
+        assert_eq!(
+            presentation["providers"][0]["label"],
+            "Codex       unavailable"
+        );
+        assert_eq!(presentation["providers"][0]["visible"], false);
+        assert_eq!(
+            presentation["providers"][1]["label"],
+            "OpenCode Go no usage data"
+        );
+        assert_eq!(presentation["providers"][1]["visible"], false);
+    }
+
+    #[test]
+    fn severity_stays_semantic_and_tracks_dashboard_thresholds() {
+        let best = |capacity_used_percent| {
+            Some(BestAvailable {
+                provider: "codex",
+                capacity_used_percent,
+            })
+        };
+
+        assert_eq!(severity(None), Severity::Unknown);
+        assert_eq!(severity(best(0)), Severity::Ok);
+        assert_eq!(severity(best(WARNING_PERCENT - 1)), Severity::Ok);
+        assert_eq!(severity(best(WARNING_PERCENT)), Severity::Warning);
+        assert_eq!(severity(best(CRITICAL_PERCENT - 1)), Severity::Warning);
+        assert_eq!(severity(best(CRITICAL_PERCENT)), Severity::Critical);
+        assert_eq!(severity(best(100)), Severity::Critical);
+        assert_eq!(usage_color(WARNING_PERCENT), Color::DarkYellow);
+        assert_eq!(usage_color(CRITICAL_PERCENT), Color::DarkRed);
+    }
+
+    #[test]
+    fn compact_reset_keeps_the_largest_whole_unit() {
+        assert_eq!(compact_reset(1_000 + 604_800, 1_000), "7d");
+        assert_eq!(compact_reset(1_000 + 10_800, 1_000), "3h");
+        assert_eq!(compact_reset(1_000 + 720, 1_000), "12m");
+        assert_eq!(compact_reset(1_000 + 30, 1_000), "30s");
+        assert_eq!(compact_reset(1_000, 2_000), "now");
+        assert_eq!(
+            freshness_text("14:03:22"),
+            "Updated 14:03:22 · ↻ = reset in"
+        );
+        let clock = local_clock(1_783_871_200);
+        assert_eq!(clock.chars().count(), 8);
+        assert!(
+            clock.chars().enumerate().all(|(index, character)| {
+                if index == 2 || index == 5 {
+                    character == ':'
+                } else {
+                    character.is_ascii_digit()
+                }
+            }),
+            "unexpected clock format: {clock}"
+        );
+        assert_eq!(local_clock(u64::MAX), "unknown");
     }
 
     #[test]

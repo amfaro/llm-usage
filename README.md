@@ -95,6 +95,18 @@ The API key is sent as a `Bearer` token to `GET https://opencode.ai/zen/go/v1/us
   "best_available": {
     "provider": "codex",
     "capacity_used_percent": 42
+  },
+  "presentation": {
+    "summary": "Codex 42% 5h ↻2h",
+    "severity": "ok",
+    "providers": [
+      {
+        "provider": "codex",
+        "label": "Codex       42% 5h ↻2h",
+        "visible": true
+      }
+    ],
+    "freshness": "Updated 14:03:22 · ↻ = reset in"
   }
 }
 ```
@@ -140,4 +152,38 @@ windows) is skipped. It is `null` when no provider qualifies, and it may point
 at a `rate_limited` provider at `100` when that is the only one left, so check
 `exhausted` before treating it as usable.
 
-`schema_version` changes only for breaking field removals, type changes, or semantic changes. New optional fields may be added without changing it. Version 2 adds the `stale` provider status so cached usage is distinct from unavailable usage. It retains `available` and `limit_reached` for existing consumers; new consumers should use `status` instead. `display` and `best_available` are additive derivations of those fields, so they do not change the version.
+### Presentation
+
+`presentation` is compact human-facing status text for any widget or
+dashboard. It is UI-agnostic: no colors, no markup, no shell, and it never
+invokes a UI. Raw and derived values stay available alongside it, so a
+consumer that wants its own wording can ignore this block entirely.
+
+- `summary`: every visible provider on one line, joined with ` · `. It is
+  `no usage data` when nothing is visible.
+- `severity`: semantic only — `ok`, `warning`, `critical`, or `unknown`.
+  Consumers choose colors. It describes `best_available`: `unknown` with no
+  best provider, `critical` at 90% or more, `warning` at 70% or more,
+  otherwise `ok`. These are the same thresholds the terminal dashboard
+  colors use. A single exhausted provider does not make the snapshot
+  `critical` while another provider still has room.
+- `providers[]`: one entry per provider in snapshot order, with the stable
+  `provider` ID, a `label`, and `visible`.
+- `freshness`: update time plus the `↻` legend. The clock is `fetched_at`
+  rendered in the machine's local timezone, so it is not a stable value.
+
+A `label` is the provider name padded to a fixed column, then its status:
+
+| Provider state | Status text |
+| --- | --- |
+| usable | `42% 5h ↻2h` — capacity, limiting window, reset in |
+| `stale` | same, plus ` (stale)` |
+| `rate_limited` | same, with capacity `100%` |
+| no comparable capacity | `no usage data` |
+| `unavailable` | `unavailable` |
+
+`↻` durations use the largest whole unit (`7d`, `3h`, `12m`, `30s`, `now`).
+`visible` is `true` when a provider reports usable capacity, so compact
+widgets can drop noise while fuller UIs still render every entry.
+
+`schema_version` changes only for breaking field removals, type changes, or semantic changes. New optional fields may be added without changing it. Version 2 adds the `stale` provider status so cached usage is distinct from unavailable usage. It retains `available` and `limit_reached` for existing consumers; new consumers should use `status` instead. `display`, `best_available`, and `presentation` are additive derivations of those fields, so they do not change the version.
