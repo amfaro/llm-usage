@@ -126,6 +126,10 @@ Provider and window `status` values are:
 UIs do not reimplement quota semantics. They add no new information and never
 change the meaning of a raw field.
 
+`presentation.summary` uses compact provider names (`Codex`, `Go`, `Claude`),
+while `presentation.providers[*].label` keeps the full provider names shown
+below.
+
 Per-provider `display`:
 
 - `name`: human-readable provider label (`Codex`, `OpenCode Go`, `Claude Code`).
