@@ -1284,6 +1284,15 @@ fn provider_label(provider: &'static str) -> &'static str {
     }
 }
 
+fn provider_summary_label(provider: &'static str) -> &'static str {
+    match provider {
+        "codex" => "Codex",
+        "opencode-go" => "Go",
+        "claude-code" => "Claude",
+        other => other,
+    }
+}
+
 /// Adds derived quota state to a snapshot without changing any raw field.
 fn snapshot_view(snapshot: &Snapshot) -> SnapshotView<'_> {
     let providers: Vec<ProviderView<'_>> = snapshot
@@ -1402,7 +1411,7 @@ fn presentation(
         .map(|view| {
             format!(
                 "{} {}",
-                view.display.name,
+                provider_summary_label(view.usage.provider),
                 presentation_status(view, fetched_at)
             )
         })
@@ -2350,7 +2359,7 @@ mod tests {
         assert_eq!(json["presentation"]["severity"], "critical");
         assert_eq!(
             json["presentation"]["summary"],
-            "Codex 100% 5h ↻16m · OpenCode Go 100% 5h ↻16m"
+            "Codex 100% 5h ↻16m · Go 100% 5h ↻16m"
         );
     }
 
@@ -2399,7 +2408,7 @@ mod tests {
 
         assert_eq!(
             presentation["summary"],
-            "Codex 42% 5h ↻2h · Claude Code 35% 7d ↻3d (stale)"
+            "Codex 42% 5h ↻2h · Claude 35% 7d ↻3d (stale)"
         );
         assert_eq!(presentation["severity"], "ok");
         assert_eq!(presentation["providers"][0]["provider"], "codex");
