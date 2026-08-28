@@ -184,6 +184,8 @@ struct ProviderDisplay {
     exhausted: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     capacity_used_percent: Option<u8>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    windows: Vec<DisplayWindow>,
     #[serde(skip_serializing_if = "Option::is_none")]
     limiting_window: Option<DisplayWindow>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1329,12 +1331,23 @@ fn provider_display(usage: &ProviderUsage) -> ProviderDisplay {
         name: provider_label(usage.provider),
         exhausted,
         capacity_used_percent,
-        limiting_window: limiting.map(|window| DisplayWindow {
-            label: window.label,
-            used_percent: rounded_percent(window.used_percent.unwrap_or_default()),
-            reset_at: window.reset_at,
-        }),
+        windows: usage
+            .windows
+            .iter()
+            .filter(|window| window.status != UsageStatus::Unavailable)
+            .filter(|window| window.used_percent.is_some())
+            .map(display_window)
+            .collect(),
+        limiting_window: limiting.map(display_window),
         next_reset_at: next_reset_at(&usage.windows),
+    }
+}
+
+fn display_window(window: &UsageWindow) -> DisplayWindow {
+    DisplayWindow {
+        label: window.label,
+        used_percent: rounded_percent(window.used_percent.unwrap_or_default()),
+        reset_at: window.reset_at,
     }
 }
 
@@ -1432,7 +1445,7 @@ fn presentation(
                 label: format!(
                     "{:<PROVIDER_WIDTH$} {}",
                     view.display.name,
-                    presentation_status(view, fetched_at)
+                    presentation_windows_status(view, fetched_at)
                 ),
                 visible: presentation_visible(view),
             })
@@ -1468,6 +1481,38 @@ fn presentation_status(view: &ProviderView<'_>, fetched_at: u64) -> String {
     };
 
     format!("{percent}%{window}{stale}")
+}
+
+/// Status for one provider listing every usable window:
+/// `42% 5h ↻2h · 12% 7d ↻3d`. Falls back to the compact status when no
+/// window is usable.
+fn presentation_windows_status(view: &ProviderView<'_>, fetched_at: u64) -> String {
+    if view.usage.status == UsageStatus::Unavailable
+        || view.display.capacity_used_percent.is_none()
+        || view.display.windows.is_empty()
+    {
+        return presentation_status(view, fetched_at);
+    }
+
+    let windows = view
+        .display
+        .windows
+        .iter()
+        .map(|window| {
+            let reset = window.reset_at.map_or_else(String::new, |reset_at| {
+                format!(" ↻{}", compact_reset(reset_at, fetched_at))
+            });
+            format!("{}% {}{reset}", window.used_percent, window.label)
+        })
+        .collect::<Vec<String>>()
+        .join(" · ");
+    let stale = if view.usage.status == UsageStatus::Stale {
+        " (stale)"
+    } else {
+        ""
+    };
+
+    format!("{windows}{stale}")
 }
 
 /// A provider is worth showing in a compact widget once it reports usable
@@ -2231,6 +2276,12 @@ mod tests {
         assert_eq!(provider["display"]["name"], "Codex");
         assert_eq!(provider["display"]["exhausted"], false);
         assert_eq!(provider["display"]["capacity_used_percent"], 42);
+        assert_eq!(provider["display"]["windows"][0]["label"], "5h");
+        assert_eq!(provider["display"]["windows"][0]["used_percent"], 42);
+        assert_eq!(provider["display"]["windows"][0]["reset_at"], 2_000);
+        assert_eq!(provider["display"]["windows"][1]["label"], "7d");
+        assert_eq!(provider["display"]["windows"][1]["used_percent"], 10);
+        assert_eq!(provider["display"]["windows"][1]["reset_at"], 9_000);
         assert_eq!(provider["display"]["limiting_window"]["label"], "5h");
         assert_eq!(provider["display"]["limiting_window"]["used_percent"], 42);
         assert_eq!(provider["display"]["limiting_window"]["reset_at"], 2_000);
@@ -2273,6 +2324,7 @@ mod tests {
         assert_eq!(display["name"], "Codex");
         assert_eq!(display["exhausted"], false);
         assert!(display["capacity_used_percent"].is_null());
+        assert!(display["windows"].is_null());
         assert!(display["limiting_window"].is_null());
         assert!(display["next_reset_at"].is_null());
         assert!(json["best_available"].is_null());
@@ -2396,7 +2448,10 @@ mod tests {
             sample_provider(
                 "codex",
                 UsageStatus::Ok,
-                vec![sample_window("5h", UsageStatus::Ok, 42.0, 1_000 + 7_200)],
+                vec![
+                    sample_window("5h", UsageStatus::Ok, 42.0, 1_000 + 7_200),
+                    sample_window("7d", UsageStatus::Ok, 12.0, 1_000 + 259_200),
+                ],
             ),
             sample_provider(
                 "claude-code",
@@ -2414,7 +2469,7 @@ mod tests {
         assert_eq!(presentation["providers"][0]["provider"], "codex");
         assert_eq!(
             presentation["providers"][0]["label"],
-            "Codex       42% 5h ↻2h"
+            "Codex       42% 5h ↻2h · 12% 7d ↻3d"
         );
         assert_eq!(presentation["providers"][0]["visible"], true);
         assert_eq!(
