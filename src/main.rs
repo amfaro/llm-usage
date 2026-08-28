@@ -31,6 +31,9 @@ const PROVIDER_WIDTH: usize = 11;
 const WINDOW_WIDTH: usize = 6;
 const COMPACT_WINDOW_WIDTH: usize = 3;
 const RESET_WIDTH: usize = "unavailable".len();
+/// Single-column mark for stale presentation status, kept narrow so the
+/// fixed-width provider column stays aligned.
+const STALE_MARK: &str = "≈";
 const WARNING_PERCENT: u8 = 70;
 const CRITICAL_PERCENT: u8 = 90;
 const CODEX_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
@@ -1474,11 +1477,7 @@ fn presentation_status(view: &ProviderView<'_>, fetched_at: u64) -> String {
             });
             format!(" {}{reset}", window.label)
         });
-    let stale = if view.usage.status == UsageStatus::Stale {
-        " (stale)"
-    } else {
-        ""
-    };
+    let stale = stale_suffix(view);
 
     format!("{percent}%{window}{stale}")
 }
@@ -1506,13 +1505,19 @@ fn presentation_windows_status(view: &ProviderView<'_>, fetched_at: u64) -> Stri
         })
         .collect::<Vec<String>>()
         .join(" · ");
-    let stale = if view.usage.status == UsageStatus::Stale {
-        " (stale)"
-    } else {
-        ""
-    };
+    let stale = stale_suffix(view);
 
     format!("{windows}{stale}")
+}
+
+/// ` ≈` for a stale provider, empty otherwise. Suffixed so the percentage
+/// keeps a predictable position for consumers that truncate from the right.
+fn stale_suffix(view: &ProviderView<'_>) -> String {
+    if view.usage.status == UsageStatus::Stale {
+        format!(" {STALE_MARK}")
+    } else {
+        String::new()
+    }
 }
 
 /// A provider is worth showing in a compact widget once it reports usable
@@ -1553,7 +1558,7 @@ fn compact_reset(reset_at: u64, now: u64) -> String {
 }
 
 fn freshness_text(clock: &str) -> String {
-    format!("Updated {clock} · ↻ = reset in")
+    format!("Updated {clock} · ↻ = reset in · {STALE_MARK} = stale")
 }
 
 fn local_clock(timestamp: u64) -> String {
@@ -2463,7 +2468,7 @@ mod tests {
 
         assert_eq!(
             presentation["summary"],
-            "Codex 42% 5h ↻2h · Claude 35% 7d ↻3d (stale)"
+            "Codex 42% 5h ↻2h · Claude 35% 7d ↻3d ≈"
         );
         assert_eq!(presentation["severity"], "ok");
         assert_eq!(presentation["providers"][0]["provider"], "codex");
@@ -2474,7 +2479,7 @@ mod tests {
         assert_eq!(presentation["providers"][0]["visible"], true);
         assert_eq!(
             presentation["providers"][1]["label"],
-            "Claude Code 35% 7d ↻3d (stale)"
+            "Claude Code 35% 7d ↻3d ≈"
         );
         assert_eq!(
             presentation["freshness"],
@@ -2538,7 +2543,7 @@ mod tests {
         assert_eq!(compact_reset(1_000, 2_000), "now");
         assert_eq!(
             freshness_text("14:03:22"),
-            "Updated 14:03:22 · ↻ = reset in"
+            "Updated 14:03:22 · ↻ = reset in · ≈ = stale"
         );
         let clock = local_clock(1_783_871_200);
         assert_eq!(clock.chars().count(), 8);
