@@ -183,7 +183,7 @@ consumer that wants its own wording can ignore this block entirely.
   `critical` while another provider still has room.
 - `providers[]`: one entry per provider in snapshot order, with the stable
   `provider` ID, a `label`, and `visible`.
-- `freshness`: update time plus the `↻` legend. The clock is `fetched_at`
+- `freshness`: update time plus the `↻` and `≈` legend. The clock is `fetched_at`
   rendered in the machine's local timezone, so it is not a stable value.
 
 A `label` is the provider name padded to a fixed column, then its status. The
@@ -192,7 +192,7 @@ status lists every usable window, while `summary` keeps only the limiting one:
 | Provider state | Status text |
 | --- | --- |
 | usable | `42% 5h ↻2h · 12% 7d ↻3d` — usage, window, reset in, per window |
-| `stale` | same, plus ` (stale)` |
+| `stale` | same, plus ` ≈` |
 | `rate_limited` | same, with each window's real usage; check `exhausted` |
 | no comparable capacity | `no usage data` |
 | `unavailable` | `unavailable` |
