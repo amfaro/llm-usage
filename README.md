@@ -83,6 +83,13 @@ The API key is sent as a `Bearer` token to `GET https://opencode.ai/zen/go/v1/us
         "name": "Codex",
         "exhausted": false,
         "capacity_used_percent": 42,
+        "windows": [
+          {
+            "label": "5h",
+            "used_percent": 42,
+            "reset_at": 1783874800
+          }
+        ],
         "limiting_window": {
           "label": "5h",
           "used_percent": 42,
@@ -140,6 +147,9 @@ Per-provider `display`:
   windows that are not `unavailable`, rounded. It is `100` whenever provider
   `status` is `rate_limited`, even if no window reached 100%. Omitted when the
   provider is `unavailable` or has no window with a usage value.
+- `windows`: every window that is not `unavailable` and reports usage, in
+  response order, with the rounded integer `used_percent`; the raw values stay
+  in the top-level `windows`. Omitted when empty.
 - `limiting_window`: the window that constrains the provider — a
   `rate_limited` window first, otherwise the highest `used_percent`. Ties keep
   response order, so the shortest window wins. `used_percent` here is the
@@ -176,13 +186,14 @@ consumer that wants its own wording can ignore this block entirely.
 - `freshness`: update time plus the `↻` legend. The clock is `fetched_at`
   rendered in the machine's local timezone, so it is not a stable value.
 
-A `label` is the provider name padded to a fixed column, then its status:
+A `label` is the provider name padded to a fixed column, then its status. The
+status lists every usable window, while `summary` keeps only the limiting one:
 
 | Provider state | Status text |
 | --- | --- |
-| usable | `42% 5h ↻2h` — capacity, limiting window, reset in |
+| usable | `42% 5h ↻2h · 12% 7d ↻3d` — usage, window, reset in, per window |
 | `stale` | same, plus ` (stale)` |
-| `rate_limited` | same, with capacity `100%` |
+| `rate_limited` | same, with each window's real usage; check `exhausted` |
 | no comparable capacity | `no usage data` |
 | `unavailable` | `unavailable` |
 
