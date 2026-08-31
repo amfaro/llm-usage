@@ -1354,14 +1354,12 @@ fn display_window(window: &UsageWindow) -> DisplayWindow {
     }
 }
 
-/// Picks the window that constrains a provider: a rate-limited window first,
-/// then the highest usage. Ties keep response order, so the shortest window
-/// wins because providers list windows shortest first.
+/// Picks a rate-limited window first, otherwise the shortest usable window.
 fn limiting_window(windows: &[UsageWindow]) -> Option<&UsageWindow> {
-    fn rank(window: &UsageWindow) -> (bool, u64) {
+    fn rank(window: &UsageWindow) -> (bool, std::cmp::Reverse<u64>) {
         (
             window.status == UsageStatus::RateLimited,
-            window.window_seconds.unwrap_or(u64::MAX),
+            std::cmp::Reverse(window.window_seconds.unwrap_or(u64::MAX)),
         )
     }
 
@@ -2232,7 +2230,12 @@ mod tests {
             status,
             used_percent: Some(used_percent),
             reset_at: Some(reset_at),
-            window_seconds: Some(18_000),
+            window_seconds: Some(match label {
+                "5h" => 18_000,
+                "7d" => 604_800,
+                "30d" => 2_592_000,
+                _ => panic!("unsupported sample window: {label}"),
+            }),
             limit_reached: Some(status == UsageStatus::RateLimited),
         }
     }
@@ -2303,6 +2306,7 @@ mod tests {
             vec![
                 sample_window("5h", UsageStatus::Ok, 23.0, 2_000),
                 sample_window("7d", UsageStatus::Ok, 49.0, 9_000),
+                sample_window("30d", UsageStatus::Ok, 28.0, 29_000),
             ],
         )]);
         let display = &json["providers"][0]["display"];
