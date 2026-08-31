@@ -1358,10 +1358,10 @@ fn display_window(window: &UsageWindow) -> DisplayWindow {
 /// then the highest usage. Ties keep response order, so the shortest window
 /// wins because providers list windows shortest first.
 fn limiting_window(windows: &[UsageWindow]) -> Option<&UsageWindow> {
-    fn rank(window: &UsageWindow) -> (bool, f64) {
+    fn rank(window: &UsageWindow) -> (bool, u64) {
         (
             window.status == UsageStatus::RateLimited,
-            window.used_percent.unwrap_or_default(),
+            window.window_seconds.unwrap_or(u64::MAX),
         )
     }
 
@@ -2293,6 +2293,24 @@ mod tests {
         assert_eq!(provider["display"]["next_reset_at"], 2_000);
         assert_eq!(json["best_available"]["provider"], "codex");
         assert_eq!(json["best_available"]["capacity_used_percent"], 42);
+    }
+
+    #[test]
+    fn limiting_window_prefers_shortest_window() {
+        let json = derived_json(vec![sample_provider(
+            "opencode-go",
+            UsageStatus::Ok,
+            vec![
+                sample_window("5h", UsageStatus::Ok, 23.0, 2_000),
+                sample_window("7d", UsageStatus::Ok, 49.0, 9_000),
+            ],
+        )]);
+        let display = &json["providers"][0]["display"];
+
+        assert_eq!(display["limiting_window"]["label"], "5h");
+        assert_eq!(display["limiting_window"]["used_percent"], 23);
+        assert_eq!(display["capacity_used_percent"], 23);
+        assert_eq!(display["exhausted"], false);
     }
 
     #[test]
