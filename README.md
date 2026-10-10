@@ -6,11 +6,22 @@ Standalone terminal dashboard for subscription quota windows. Supports Codex, Op
 cargo run -- watch                 # refresh every 30 seconds
 cargo run -- once                  # one terminal snapshot
 cargo run -- json                  # one stable JSON snapshot
+cargo run -- json --interval 60 --output ~/.cache/llm-usage/usage.json
 cargo run -- once --provider codex
 cargo run -- watch --interval 60 --no-color
 ```
 
 `watch` is the default command. Press `q` to exit. Use `--provider codex`, `--provider opencode-go`, or `--provider claude-code` repeatedly to filter providers.
+
+### Status bars and widgets
+
+Widgets that poll on a timer should read a file kept fresh by one long-running process rather than spawn `json` on every refresh:
+
+```sh
+llm-usage json --source cliproxy --interval 60 --output ~/.cache/llm-usage/usage.json
+```
+
+`--output` atomically replaces the file (temporary file plus rename), so readers never see a partial write. Its contents match what `json` prints. `--interval` requires `--output` and keeps the process running until it is terminated, so run it under a service manager such as launchd or systemd. Because one process serves every refresh, in-memory Claude throttling, `Retry-After` cooldowns, discovery caching, and bounded stale fallback all apply between refreshes. Provider failures appear in the JSON as usual; a failed file write is reported on stderr and retried on the next refresh. `--output` without `--interval` writes one snapshot and exits.
 
 ## CLIProxyAPI proof of concept
 
@@ -199,7 +210,8 @@ upstream rejection, malformed usage, and rate limits remain unavailable.
   account identity/revision metadata. If a credential is replaced without any
   identity or revision metadata changing, restart `watch` to discard old state.
   Restarting `watch`, or repeatedly invoking `once`/`json`, does not share cooldowns
-  or cached data. Prefer a long-running `watch` rather than rapid repeated polls.
+  or cached data. Prefer a long-running `watch`, or `json --interval` for widgets,
+  rather than rapid repeated polls.
 - Management-key rejection and upstream credential rejection produce distinct,
   redacted diagnostics; upstream response bodies are never printed.
 - Automated mock-HTTP tests cover all three providers, credential selection,
@@ -251,7 +263,7 @@ The API key is sent as a `Bearer` token to `GET https://opencode.ai/zen/go/v1/us
 
 ## Exit status
 
-`once` and `json` exit `0` when at least one selected provider returns usage, otherwise `1`. Unavailable providers remain in text and JSON output with a redacted error. `watch` keeps retrying on later refreshes.
+`once` and `json` exit `0` when at least one selected provider returns usage, otherwise `1`. `json --output` also exits `1` when the file cannot be written. Unavailable providers remain in text and JSON output with a redacted error. `watch` and `json --interval` keep retrying on later refreshes.
 
 ## JSON contract
 
