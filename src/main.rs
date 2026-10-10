@@ -60,8 +60,8 @@ enum Command {
     Watch(WatchArgs),
     /// Print one terminal dashboard snapshot.
     Once(DisplayArgs),
-    /// Print one JSON snapshot.
-    Json(QueryArgs),
+    /// Print one JSON snapshot, or keep a JSON file refreshed.
+    Json(JsonArgs),
 }
 
 #[derive(Clone, Copy, Default, ValueEnum)]
@@ -114,6 +114,18 @@ struct WatchArgs {
     /// Seconds between refreshes.
     #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..))]
     interval: u64,
+}
+
+#[derive(Args)]
+struct JsonArgs {
+    #[command(flatten)]
+    query: QueryArgs,
+    /// Atomically replace this file with the snapshot instead of printing it.
+    #[arg(long, value_name = "PATH")]
+    output: Option<PathBuf>,
+    /// Keep running and rewrite `--output` every this many seconds.
+    #[arg(long, requires = "output", value_parser = clap::value_parser!(u64).range(1..))]
+    interval: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -456,14 +468,31 @@ fn print_once(args: &DisplayArgs) -> i32 {
     exit_code(&snapshot)
 }
 
-fn print_json(args: &QueryArgs) -> i32 {
-    let mut source = UsageSource::new(args.source);
-    let snapshot = fetch_snapshot(&args.providers, &mut source);
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&snapshot_view(&snapshot)).expect("snapshot serializes")
-    );
-    exit_code(&snapshot)
+/// Reuses one source across refreshes so in-memory throttles, cooldowns, and
+/// stale fallback carry over, unlike repeated one-shot invocations.
+fn print_json(args: &JsonArgs) -> i32 {
+    let mut source = UsageSource::new(args.query.source);
+    loop {
+        let snapshot = fetch_snapshot(&args.query.providers, &mut source);
+        let json =
+            serde_json::to_string_pretty(&snapshot_view(&snapshot)).expect("snapshot serializes");
+        let Some(output) = &args.output else {
+            println!("{json}");
+            return exit_code(&snapshot);
+        };
+        let written = write_atomically(output, format!("{json}\n").as_bytes());
+        if let Err(error) = &written {
+            eprintln!("llm-usage: failed to write {}: {error}", output.display());
+        }
+        let Some(interval) = args.interval else {
+            return if written.is_ok() {
+                exit_code(&snapshot)
+            } else {
+                1
+            };
+        };
+        thread::sleep(Duration::from_secs(interval));
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1020,15 +1049,23 @@ fn read_claude_code_cache(path: &Path) -> Option<ClaudeCodeCache> {
 }
 
 fn write_claude_code_cache(path: &Path, cache: &ClaudeCodeCache) -> io::Result<()> {
+    write_atomically(path, &serde_json::to_vec(cache).map_err(io::Error::other)?)
+}
+
+/// Writes a sibling temporary file and renames it over `path`, so readers see
+/// either the previous or the new contents, never a partial write.
+fn write_atomically(path: &Path, contents: &[u8]) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let temporary = path.with_extension(format!("json.tmp-{}", std::process::id()));
-    fs::write(
-        &temporary,
-        serde_json::to_vec(cache).map_err(io::Error::other)?,
-    )?;
-    fs::rename(temporary, path)
+    let mut temporary = path.as_os_str().to_owned();
+    temporary.push(format!(".tmp-{}", std::process::id()));
+    let temporary = PathBuf::from(temporary);
+    let result = fs::write(&temporary, contents).and_then(|()| fs::rename(&temporary, path));
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
 }
 
 fn claude_code_retry_after(value: Option<&HeaderValue>, now: DateTime<Utc>) -> Option<u64> {
@@ -2966,5 +3003,77 @@ mod tests {
             render_dashboard(&snapshot, true, default_layout(true))
                 .contains(&SetForegroundColor(Color::DarkGrey).to_string())
         );
+    }
+
+    #[test]
+    fn json_interval_requires_output_and_positive_seconds() {
+        let cli = Cli::try_parse_from(["llm-usage", "json"]).unwrap();
+        let Some(Command::Json(args)) = cli.command else {
+            panic!("expected JSON command")
+        };
+        assert!(args.output.is_none());
+        assert!(args.interval.is_none());
+
+        let cli = Cli::try_parse_from([
+            "llm-usage",
+            "json",
+            "--output",
+            "usage.json",
+            "--interval",
+            "60",
+        ])
+        .unwrap();
+        let Some(Command::Json(args)) = cli.command else {
+            panic!("expected JSON command")
+        };
+        assert_eq!(args.output.as_deref(), Some(Path::new("usage.json")));
+        assert_eq!(args.interval, Some(60));
+
+        assert!(Cli::try_parse_from(["llm-usage", "json", "--interval", "60"]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "llm-usage",
+                "json",
+                "--output",
+                "usage.json",
+                "--interval",
+                "0",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn write_atomically_creates_parent_and_replaces_without_leftovers() {
+        let directory =
+            env::temp_dir().join(format!("llm-usage-atomic-test-{}", std::process::id()));
+        let path = directory.join("nested/usage.json");
+
+        write_atomically(&path, b"first").unwrap();
+        write_atomically(&path, b"second").unwrap();
+        let contents = fs::read_to_string(&path).unwrap();
+        let entries = fs::read_dir(path.parent().unwrap()).unwrap().count();
+        fs::remove_dir_all(directory).unwrap();
+
+        assert_eq!(contents, "second");
+        assert_eq!(entries, 1);
+    }
+
+    #[test]
+    fn write_atomically_failure_removes_temporary_file() {
+        let directory = env::temp_dir().join(format!(
+            "llm-usage-atomic-failure-test-{}",
+            std::process::id()
+        ));
+        // A directory at the target path makes the final rename fail.
+        let path = directory.join("usage.json");
+        fs::create_dir_all(&path).unwrap();
+
+        let result = write_atomically(&path, b"contents");
+        let entries = fs::read_dir(&directory).unwrap().count();
+        fs::remove_dir_all(directory).unwrap();
+
+        assert!(result.is_err());
+        assert_eq!(entries, 1);
     }
 }

@@ -1089,10 +1089,10 @@ mod tests {
     #[test]
     fn cli_source_is_explicit_and_local_by_default() {
         let cli = Cli::try_parse_from(["llm-usage", "json"]).unwrap();
-        let Some(Command::Json(query)) = cli.command else {
+        let Some(Command::Json(args)) = cli.command else {
             panic!("expected JSON command")
         };
-        assert!(matches!(query.source, Source::Local));
+        assert!(matches!(args.query.source, Source::Local));
         let cli = Cli::try_parse_from([
             "llm-usage",
             "watch",
