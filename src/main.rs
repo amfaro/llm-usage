@@ -24,6 +24,8 @@ use reqwest::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+mod cliproxy;
+
 const JSON_SCHEMA_VERSION: u8 = 2;
 const BAR_WIDTH: usize = 28;
 const BAR_WIDTH_COMPACT: usize = 16;
@@ -62,11 +64,35 @@ enum Command {
     Json(QueryArgs),
 }
 
+#[derive(Clone, Copy, Default, ValueEnum)]
+enum Source {
+    #[default]
+    Local,
+    Cliproxy,
+}
+
 #[derive(Args, Default)]
 struct QueryArgs {
     /// Restrict output to one or more providers.
     #[arg(long = "provider", value_enum)]
     providers: Vec<Provider>,
+    /// Use local credentials or `CLIProxyAPI`'s remote credentials (v8).
+    #[arg(long, value_enum, default_value = "local")]
+    source: Source,
+}
+
+enum UsageSource {
+    Local,
+    Cliproxy(Result<Box<cliproxy::Session>, &'static str>),
+}
+
+impl UsageSource {
+    fn new(source: Source) -> Self {
+        match source {
+            Source::Local => Self::Local,
+            Source::Cliproxy => Self::Cliproxy(cliproxy::Session::from_env().map(Box::new)),
+        }
+    }
 }
 
 #[derive(Args, Default)]
@@ -295,10 +321,11 @@ fn main() {
 fn watch(args: &WatchArgs) -> i32 {
     let terminal = io::stdout().is_terminal();
     let colors = terminal && !args.display.no_color && env::var_os("NO_COLOR").is_none();
+    let mut source = UsageSource::new(args.display.query.source);
     loop {
         let dimensions = terminal.then(size).and_then(Result::ok);
         let columns = dimensions.map(|(columns, _)| columns);
-        let snapshot = fetch_snapshot(&args.display.query.providers);
+        let snapshot = fetch_snapshot(&args.display.query.providers, &mut source);
         let layout = dashboard_layout(&snapshot, args.display.compact, columns);
         let hint = refresh_hint(args.interval, args.interval, columns);
         let dashboard = render_dashboard_with_hint(&snapshot, colors, layout, Some(&hint), columns);
@@ -416,7 +443,8 @@ fn is_resize_event(event: &Event) -> bool {
 }
 
 fn print_once(args: &DisplayArgs) -> i32 {
-    let snapshot = fetch_snapshot(&args.query.providers);
+    let mut source = UsageSource::new(args.query.source);
+    let snapshot = fetch_snapshot(&args.query.providers, &mut source);
     let terminal = io::stdout().is_terminal();
     let colors = terminal && !args.no_color && env::var_os("NO_COLOR").is_none();
     let columns = terminal
@@ -429,7 +457,8 @@ fn print_once(args: &DisplayArgs) -> i32 {
 }
 
 fn print_json(args: &QueryArgs) -> i32 {
-    let snapshot = fetch_snapshot(&args.providers);
+    let mut source = UsageSource::new(args.source);
+    let snapshot = fetch_snapshot(&args.providers, &mut source);
     println!(
         "{}",
         serde_json::to_string_pretty(&snapshot_view(&snapshot)).expect("snapshot serializes")
@@ -470,13 +499,27 @@ fn exit_code(snapshot: &Snapshot) -> i32 {
     i32::from(!snapshot.providers.iter().any(|provider| provider.available))
 }
 
-fn fetch_snapshot(requested: &[Provider]) -> Snapshot {
+fn fetch_snapshot(requested: &[Provider], source: &mut UsageSource) -> Snapshot {
     let providers = if requested.is_empty() {
         vec![Provider::Codex, Provider::OpencodeGo, Provider::ClaudeCode]
     } else {
         requested.to_vec()
     };
     let fetched_at = now();
+    if let UsageSource::Cliproxy(session) = source {
+        let providers = match session {
+            Ok(session) => session.fetch(&providers, fetched_at),
+            Err(error) => providers
+                .into_iter()
+                .map(|provider| cliproxy::unavailable(provider, error, fetched_at))
+                .collect(),
+        };
+        return Snapshot {
+            schema_version: JSON_SCHEMA_VERSION,
+            fetched_at,
+            providers,
+        };
+    }
     let client = Client::builder()
         .timeout(Duration::from_secs(15))
         .user_agent(concat!("llm-usage/", env!("CARGO_PKG_VERSION")))
@@ -1107,8 +1150,7 @@ fn claude_code_keychain_credentials() -> Option<(String, Option<String>)> {
     }
     let now_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| u64::try_from(d.as_millis()).unwrap_or(0))
-        .unwrap_or(0);
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(0));
     let mut best: Option<(u64, (String, Option<String>))> = None;
     for service in &services {
         let output = std::process::Command::new("security")
