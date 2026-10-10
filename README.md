@@ -12,7 +12,204 @@ cargo run -- watch --interval 60 --no-color
 
 `watch` is the default command. Press `q` to exit. Use `--provider codex`, `--provider opencode-go`, or `--provider claude-code` repeatedly to filter providers.
 
-## Credentials
+## CLIProxyAPI proof of concept
+
+### Quick start with Doppler
+
+From the PoC worktree, in fish or any other shell:
+
+```sh
+mise run proxy        # one live snapshot: Codex, OpenCode Go, and Claude Code
+mise run proxy watch  # continuous dashboard
+mise run proxy json   # JSON output
+```
+
+This task injects only `WORK_LLM_USAGE_CLIPROXY_URL` and
+`WORK_LLM_USAGE_CLIPROXY_MANAGEMENT_KEY` from Doppler project `shared`, config
+`dev_personal`. It disables Doppler's disk fallback cache and keeps your existing
+`PI_CODING_AGENT_DIR` and `CLAUDE_CONFIG_DIR`. A pre-existing Doppler CLI login is
+required. All proxy settings accept their `WORK_`-prefixed equivalent; a nonempty
+unprefixed setting takes precedence.
+
+### Manual configuration
+
+Use `--source cliproxy` on `watch`, `once`, or `json` to fetch **subscription
+quota windows** using credentials held by a remote CLIProxyAPI server. Local
+credentials are the default (`--source local`); setting proxy environment
+variables alone does not change the source.
+
+This PoC targets the **v8 management API**, as served by CLIProxyAPI 8.0.23.
+It does not use the older `/v0/management` API.
+
+```sh
+export LLM_USAGE_CLIPROXY_URL='http://100.97.112.40:8318'
+# Supply this through your work secret manager or a hidden shell prompt.
+# In Bash, this avoids putting the secret into shell history:
+read -rsp 'CLIProxyAPI management key: ' LLM_USAGE_CLIPROXY_MANAGEMENT_KEY
+printf '\n'
+export LLM_USAGE_CLIPROXY_MANAGEMENT_KEY
+
+cargo run -- json --source cliproxy --provider codex
+cargo run -- once --source cliproxy --provider claude-code
+cargo run -- once --source cliproxy --provider opencode-go
+cargo run -- watch --source cliproxy  # all three providers
+
+# Remove the key from this shell when finished:
+unset LLM_USAGE_CLIPROXY_MANAGEMENT_KEY
+```
+
+Run these commands from the PoC checkout, not a checkout without this feature.
+When using mise-managed tools noninteractively, prefix commands with `mise exec --`.
+`LLM_USAGE_CLIPROXY_URL` accepts an HTTP(S) server base URL or a URL ending in
+`/v8/management`; do not supply the `management.html#/auth-files` page URL.
+
+### Remote credentials and account selection
+
+The management key is the **management UI login key**, not a normal inference
+API key. It grants administrative access, so use a trusted server and HTTPS or
+an encrypted private network. The program never logs the key, does not accept
+it as a command-line argument, and refuses management HTTP redirects.
+
+The client lists remote credential metadata using
+`GET /v8/management/credentials`, then submits an upstream quota `GET` through
+`POST /v8/management/requests/api-call`. Its upstream Authorization header is
+literally `Bearer $TOKEN$`; CLIProxyAPI substitutes the selected credential
+server-side. The PoC does not download auth files, request credential refreshes,
+or write provider tokens anywhere. Provider refresh is left to the proxy.
+
+A single enabled matching credential is selected automatically. If multiple
+accounts match, the provider stays unavailable until you select one explicitly:
+
+```sh
+export LLM_USAGE_CLIPROXY_CODEX_AUTH_INDEX='<Codex auth_index>'
+export LLM_USAGE_CLIPROXY_CLAUDE_AUTH_INDEX='<Claude auth_index>'
+export LLM_USAGE_CLIPROXY_OPENCODE_GO_AUTH_INDEX='<Go auth_index>'
+```
+
+Use the `auth_index` from remote metadata, not the filename or API key. Listed
+disabled accounts and accounts of a different provider are never selected.
+Configured Go API-key groups may be absent from this metadata; the client can
+instead discover their indexes from scoped provider configuration as described
+below.
+For Codex, account IDs are taken from credential metadata/attributes or a JSON
+`id_token`. If the server only provides a JWT string, or you need a specific
+account ID, supply it explicitly:
+
+```sh
+export LLM_USAGE_CLIPROXY_CODEX_ACCOUNT_ID='<ChatGPT account ID>'
+```
+
+### OpenCode Go through CLIProxyAPI
+
+Use the Go API key already configured **on the proxy server**, in an
+OpenAI-compatible provider (group) with upstream base URL
+`https://opencode.ai/zen/go/v1`. No additional provider or local key is needed
+when that group is already configured. For new setup, use the server's
+configuration or management UI and your approved secret manager; do not copy
+personal credentials into a work profile.
+
+**Important v8.0.23 distinction:** config-synthesized compatible API keys can be
+omitted from `GET /v8/management/credentials` because they have neither a backing
+auth file nor the `runtime_only` attribute. Their absence does **not** mean the
+provider is unconfigured. `POST /v8/management/requests/api-call` can still resolve
+their runtime `auth_index`.
+
+**Automatic discovery is the default; no manual index is needed for a single
+matching enabled key.** If ordinary credential metadata does not expose the Go
+group, the client reads only
+`GET /v8/management/config/api-keys/openai-compatibility`. It matches the configured
+group name (default `opencode-go`), checks that the upstream URL is HTTPS on
+`opencode.ai` at `/zen/go/v1`, and selects its per-key `auth_index`. Unrelated or
+disabled groups/keys are not selected. Missing, malformed, duplicate, or conflicting
+indexes fail closed rather than silently dropping entries to choose another key.
+
+**Security trade-off:** the scoped configuration response includes raw API keys,
+headers, and other fields, potentially for other compatible groups too. Those
+bytes briefly enter client memory. Typed deserialization discards secret fields;
+only the selected group's name, canonical upstream URL, enabled state, and opaque
+index are retained. Raw keys are never logged, persisted, cached, or forwarded.
+Use this only with an approved work-provider configuration. The client does not
+fetch the complete server configuration or auth files, and never uses config
+metadata to override a listed unrelated or disabled credential.
+
+Sanitized discovery metadata is cached **in memory only** for five minutes within
+a running session; no raw configuration response is cached. Failed discovery
+backs off for at least five minutes (or the server's `Retry-After` for HTTP 429).
+Key rotation is picked up on the next metadata refresh, or immediately after
+restarting `watch`. Config-discovery failures leave Go unavailable without
+preventing Codex or Claude from reporting usage.
+
+When compatible-key metadata is exposed by `/credentials`, it is used directly
+without reading configuration. An exact `openai-compatible-opencode-go` provider
+(or `opencode-go`) is recognized; generic `openai-compatibility` metadata requires
+an exact group label. Unrelated compatible groups and OAuth accounts are never
+guessed to be Go credentials.
+
+If your configured Go group uses another name, identify it explicitly:
+
+```sh
+export LLM_USAGE_CLIPROXY_OPENCODE_GO_PROVIDER='company-go'
+```
+
+The group setting also accepts its internal provider key
+(`openai-compatible-company-go`). For multiple matching keys, select one with
+`LLM_USAGE_CLIPROXY_OPENCODE_GO_AUTH_INDEX='<Go auth_index>'`. An explicit hidden
+16-character hexadecimal index is an operator-approved Go reference and avoids
+configuration reads; the client cannot verify its group if metadata is hidden.
+Listed indexes still must pass the normal exact-group and disabled checks. This
+optional override is not needed for normal single-key discovery.
+
+Both settings accept their `WORK_` variants. The Doppler task injects only the two
+connection settings listed above; provide optional selectors/group settings in
+the invoking environment.
+
+The dashboard submits `GET https://opencode.ai/zen/go/v1/usage` through
+`POST /v8/management/requests/api-call`, with `Bearer $TOKEN$`. CLIProxyAPI replaces
+the placeholder with the selected server-held API key. The existing Go parser
+reports the rolling 5h, weekly 7d, and monthly 30d windows with
+`source: "cliproxy"` and plan `Go`.
+
+Missing, disabled, or ambiguous credentials leave Go unavailable with a redacted
+diagnostic; other configured providers continue working. There is **no local
+fallback**, even if `OPENCODE_GO_API_KEY` is set. A Go subscription is required;
+upstream rejection, malformed usage, and rate limits remain unavailable.
+
+### Behavior and limitations
+
+- **No local fallback:** proxy mode never calls local provider credential
+  discovery, even if remote configuration, authentication, or quota checks fail.
+  It neither reads `$PI_CODING_AGENT_DIR/auth.json` nor Claude's local credentials
+  or local quota cache. Keep both work-profile variables (`PI_CODING_AGENT_DIR`
+  and `CLAUDE_CONFIG_DIR`) set when working in this repository.
+- Codex, OpenCode Go, and Claude use the same upstream quota endpoints and window
+  parsers as local mode. Remote output has `source: "cliproxy"`; the existing JSON
+  schema, derived quota state, and presentation fields are unchanged.
+- The proxy task selects all three providers. Use `--provider` with manual commands
+  to restrict the selection; providers without remote credentials remain visible
+  as unavailable.
+- This reports actual upstream subscription quotas, **not proxy request/token
+  counters**. The observability usage API is not integrated in this PoC.
+- Claude quota requests are limited to one successful refresh per five minutes
+  within a running session. HTTP 429 honors upstream `Retry-After` (minimum one
+  minute; default 15 minutes). Transient quota/discovery failures retain sanitized
+  cached windows as stale for at most one hour; authentication rejection discards
+  cached usage. Discovery failures also pause management requests for at least
+  five minutes, or for `Retry-After` when the management API returns HTTP 429.
+  The remote cache is **in memory only**, isolated by server session and exposed
+  account identity/revision metadata. If a credential is replaced without any
+  identity or revision metadata changing, restart `watch` to discard old state.
+  Restarting `watch`, or repeatedly invoking `once`/`json`, does not share cooldowns
+  or cached data. Prefer a long-running `watch` rather than rapid repeated polls.
+- Management-key rejection and upstream credential rejection produce distinct,
+  redacted diagnostics; upstream response bodies are never printed.
+- Automated mock-HTTP tests cover all three providers, credential selection,
+  token placeholders, and failure cases. Live Codex, OpenCode Go, and Claude quotas
+  were verified using the Doppler-backed configuration, including automatic Go
+  discovery from the existing server group. Go discovery tests cover the
+  scoped configuration read, secret stripping, metadata caching, key rotation,
+  upstream validation, ambiguity, and optional explicit indexes.
+
+## Credentials (local mode)
 
 Secrets are read but never written or printed.
 
@@ -143,16 +340,16 @@ Per-provider `display`:
   Unknown provider IDs fall back to the ID itself.
 - `exhausted`: `true` only when provider `status` is `rate_limited`. An
   `unavailable` provider is not exhausted; check `status` for that case.
-- `capacity_used_percent`: integer 0–100, the highest `used_percent` among
-  windows that are not `unavailable`, rounded. It is `100` whenever provider
+- `capacity_used_percent`: integer 0–100, the limiting window's `used_percent`,
+  rounded (selection rule below). It is `100` whenever provider
   `status` is `rate_limited`, even if no window reached 100%. Omitted when the
   provider is `unavailable` or has no window with a usage value.
 - `windows`: every window that is not `unavailable` and reports usage, in
   response order, with the rounded integer `used_percent`; the raw values stay
   in the top-level `windows`. Omitted when empty.
-- `limiting_window`: the window that constrains the provider — a
-  `rate_limited` window first, otherwise the highest `used_percent`. Ties keep
-  response order, so the shortest window wins. `used_percent` here is the
+- `limiting_window`: a `rate_limited` window first, otherwise the shortest
+  usable window (not necessarily the highest `used_percent`). Ties keep
+  response order. `used_percent` here is the
   rounded integer; the raw value stays in `windows`. Omitted when no window
   reports usage.
 - `next_reset_at`: soonest `reset_at` among windows that are not

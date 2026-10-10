@@ -1,5 +1,6 @@
 [tools]
 rust = [{ version = "stable", components = "clippy,rustfmt" }]
+doppler = "3.76.6"
 
 [tasks.check]
 description = "Compile check"
@@ -16,3 +17,8 @@ run = "cargo fmt --check"
 [tasks.clippy]
 description = "Run clippy (pedantic)"
 run = "cargo clippy -- --deny clippy::pedantic"
+
+[tasks.proxy]
+description = "Show remote Codex, Go, and Claude quotas using Doppler (once, watch, or json)"
+usage = 'arg "[mode]" default="once" help="once, watch, or json"'
+run = 'doppler run --project shared --config dev_personal --no-fallback --only-secrets WORK_LLM_USAGE_CLIPROXY_URL,WORK_LLM_USAGE_CLIPROXY_MANAGEMENT_KEY -- cargo run -- "${usage_mode}" --source cliproxy --provider codex --provider opencode-go --provider claude-code'
