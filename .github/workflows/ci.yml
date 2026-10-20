@@ -14,7 +14,9 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v7
       - name: Setup mise
-        uses: jdx/mise-action@v5
+        uses: amfaro/actions/setup-mise@v1
+        with:
+          tools: rust
       - name: Setup Cache
         uses: useblacksmith/rust-cache@v3
         with:
