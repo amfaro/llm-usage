@@ -23,7 +23,6 @@ tasks:
     with:
       repository: https://github.com/amfaro/llm-usage.git
       ref: ${{ init.commit-sha }}
-      github-token: ${{ github.token }}
 
   - key: rust-only
     use: code
