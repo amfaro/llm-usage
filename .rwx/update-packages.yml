@@ -1,0 +1,47 @@
+# Propose same-major RWX package updates for every definition in .rwx/.
+# A newer compatible release opens (or updates) one "Update RWX packages" PR
+# that squash-auto-merges once the required "RWX: ci.yml (pull request)" check
+# passes; a failing check blocks the merge. No update means no PR.
+#
+# Credentials: amfaro-rwx-workflows-management (RWX vault) clones main, pushes
+# the rwx-update- branch and opens the PR. It is used only by this
+# default-branch cron/dispatch workflow, never by .rwx/ci.yml candidate runs.
+#
+# Recovery: close the PR and delete its rwx-update- branch to discard a bad
+# proposal; the next run re-opens it from main. Run on demand with
+# `rwx dispatch llm-usage-update-rwx-packages`.
+on:
+  cron:
+    - key: update-rwx-packages-weekly
+      # Monday 10:00 UTC
+      schedule: '0 10 * * 1'
+      init:
+        commit-sha: ${{ event.git.sha }}
+
+  dispatch:
+    key: llm-usage-update-rwx-packages
+    init:
+      commit-sha: ${{ event.git.sha }}
+
+  cli:
+    init:
+      commit-sha: ${{ event.git.sha }}
+
+concurrency-pools:
+  - id: amfaro/llm-usage:update-rwx-packages
+    capacity: 1
+    on-overflow: queue
+
+base:
+  image: ubuntu:24.04
+  config: rwx/base 1.2.0
+
+tasks:
+  - key: update-rwx-packages
+    call: rwx/update-packages-github 2.2.0
+    with:
+      repository: https://github.com/amfaro/llm-usage.git
+      ref: ${{ init.commit-sha }}
+      github-token: ${{ vaults.rwx-github-workflows.github-apps.amfaro-rwx-workflows-management.token }}
+      allow-major-version-change: false
+      enable-auto-merge: true
