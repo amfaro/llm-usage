@@ -8,7 +8,7 @@ use std::{
 };
 
 use chrono::{DateTime, Local, Utc};
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum, error::ErrorKind};
 use crossterm::{
     cursor::{MoveTo, RestorePosition, SavePosition},
     event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
@@ -79,6 +79,8 @@ struct QueryArgs {
     /// Use local credentials or `CLIProxyAPI`'s remote credentials (v8).
     #[arg(long, value_enum, default_value = "local")]
     source: Source,
+    #[command(flatten)]
+    cliproxy: cliproxy::Options,
 }
 
 enum UsageSource {
@@ -87,10 +89,12 @@ enum UsageSource {
 }
 
 impl UsageSource {
-    fn new(source: Source) -> Self {
-        match source {
+    fn new(query: &QueryArgs) -> Self {
+        match query.source {
             Source::Local => Self::Local,
-            Source::Cliproxy => Self::Cliproxy(cliproxy::Session::from_env().map(Box::new)),
+            Source::Cliproxy => {
+                Self::Cliproxy(cliproxy::Session::from_env(query.cliproxy.clone()).map(Box::new))
+            }
         }
     }
 }
@@ -316,7 +320,7 @@ struct CachedUsageWindow {
 }
 
 fn main() {
-    let cli = Cli::parse();
+    let cli = parse_cli(env::args_os()).unwrap_or_else(|error| error.exit());
     let command = cli.command.unwrap_or(Command::Watch(WatchArgs {
         display: DisplayArgs::default(),
         interval: 30,
@@ -330,10 +334,34 @@ fn main() {
     std::process::exit(exit);
 }
 
+fn parse_cli<I, T>(args: I) -> Result<Cli, clap::Error>
+where
+    I: IntoIterator<Item = T>,
+    T: Into<std::ffi::OsString> + Clone,
+{
+    let cli = Cli::try_parse_from(args)?;
+    let query = match &cli.command {
+        Some(Command::Watch(args)) => Some(&args.display.query),
+        Some(Command::Once(args)) => Some(&args.query),
+        Some(Command::Json(args)) => Some(&args.query),
+        None => None,
+    };
+    if let Some(query) = query
+        && matches!(query.source, Source::Local)
+        && query.cliproxy.any()
+    {
+        return Err(Cli::command().error(
+            ErrorKind::MissingRequiredArgument,
+            "--cliproxy-url, --cliproxy-key-env, and the --*-auth-index flags require --source cliproxy",
+        ));
+    }
+    Ok(cli)
+}
+
 fn watch(args: &WatchArgs) -> i32 {
     let terminal = io::stdout().is_terminal();
     let colors = terminal && !args.display.no_color && env::var_os("NO_COLOR").is_none();
-    let mut source = UsageSource::new(args.display.query.source);
+    let mut source = UsageSource::new(&args.display.query);
     loop {
         let dimensions = terminal.then(size).and_then(Result::ok);
         let columns = dimensions.map(|(columns, _)| columns);
@@ -455,7 +483,7 @@ fn is_resize_event(event: &Event) -> bool {
 }
 
 fn print_once(args: &DisplayArgs) -> i32 {
-    let mut source = UsageSource::new(args.query.source);
+    let mut source = UsageSource::new(&args.query);
     let snapshot = fetch_snapshot(&args.query.providers, &mut source);
     let terminal = io::stdout().is_terminal();
     let colors = terminal && !args.no_color && env::var_os("NO_COLOR").is_none();
@@ -471,7 +499,7 @@ fn print_once(args: &DisplayArgs) -> i32 {
 /// Reuses one source across refreshes so in-memory throttles, cooldowns, and
 /// stale fallback carry over, unlike repeated one-shot invocations.
 fn print_json(args: &JsonArgs) -> i32 {
-    let mut source = UsageSource::new(args.query.source);
+    let mut source = UsageSource::new(&args.query);
     loop {
         let snapshot = fetch_snapshot(&args.query.providers, &mut source);
         let json =
@@ -3038,6 +3066,60 @@ mod tests {
                 "usage.json",
                 "--interval",
                 "0",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn cliproxy_auth_index_flags_require_cliproxy_source() {
+        let cli = parse_cli([
+            "llm-usage",
+            "json",
+            "--source",
+            "cliproxy",
+            "--codex-auth-index",
+            "codex-work",
+            "--claude-auth-index",
+            "claude-work",
+        ])
+        .unwrap();
+        let Some(Command::Json(args)) = cli.command else {
+            panic!("expected JSON command")
+        };
+        assert!(args.query.cliproxy.any());
+
+        assert!(
+            parse_cli([
+                "llm-usage",
+                "json",
+                "--source",
+                "cliproxy",
+                "--cliproxy-url",
+                "http://personal:8318",
+                "--cliproxy-key-env",
+                "PERSONAL_KEY",
+            ])
+            .is_ok()
+        );
+        for flag in ["--cliproxy-url", "--cliproxy-key-env"] {
+            assert!(
+                parse_cli(["llm-usage", "once", "--source", "cliproxy", flag, "value"]).is_err()
+            );
+        }
+
+        let error = parse_cli(["llm-usage", "once", "--claude-auth-index", "claude-work"])
+            .err()
+            .unwrap();
+        assert_eq!(error.kind(), ErrorKind::MissingRequiredArgument);
+        assert!(
+            parse_cli([
+                "llm-usage",
+                "watch",
+                "--source",
+                "cliproxy",
+                "--codex-auth-index",
+                "",
             ])
             .is_err()
         );

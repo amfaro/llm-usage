@@ -3,6 +3,7 @@
 use std::{collections::HashMap, env, time::Duration};
 
 use chrono::Utc;
+use clap::{Args, builder::NonEmptyStringValueParser};
 use reqwest::{StatusCode, Url, blocking::Client, header::HeaderValue, redirect::Policy};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -52,6 +53,39 @@ struct GoDiscovery {
     refresh_after: u64,
     // Only sanitized metadata or constant, redacted failure messages survive.
     result: Result<Vec<Value>, Failure>,
+}
+
+/// Command-line server and credential selection. Each option takes precedence
+/// over its environment variable; a selected index must match a listed credential,
+/// with no fallback to another account. The management key is never accepted as an
+/// argument, only the name of the variable holding it.
+#[derive(Args, Clone, Default)]
+pub(super) struct Options {
+    /// `CLIProxyAPI` server URL; overrides `LLM_USAGE_CLIPROXY_URL`.
+    #[arg(long = "cliproxy-url", value_name = "URL", requires = "key_env", value_parser = NonEmptyStringValueParser::new())]
+    url: Option<String>,
+    /// Name of the environment variable holding the management key for `--cliproxy-url`.
+    #[arg(long = "cliproxy-key-env", value_name = "NAME", requires = "url", value_parser = NonEmptyStringValueParser::new())]
+    key_env: Option<String>,
+    /// `CLIProxyAPI` `auth_index` of the Codex credential to use.
+    #[arg(long = "codex-auth-index", value_name = "INDEX", value_parser = NonEmptyStringValueParser::new())]
+    codex: Option<String>,
+    /// `CLIProxyAPI` `auth_index` of the Claude credential to use.
+    #[arg(long = "claude-auth-index", value_name = "INDEX", value_parser = NonEmptyStringValueParser::new())]
+    claude: Option<String>,
+    /// `CLIProxyAPI` `auth_index` of the `OpenCode` Go key to use.
+    #[arg(long = "opencode-go-auth-index", value_name = "INDEX", value_parser = NonEmptyStringValueParser::new())]
+    opencode_go: Option<String>,
+}
+
+impl Options {
+    pub(super) fn any(&self) -> bool {
+        self.url.is_some()
+            || self.key_env.is_some()
+            || self.codex.is_some()
+            || self.claude.is_some()
+            || self.opencode_go.is_some()
+    }
 }
 
 pub(super) struct Session {
@@ -126,10 +160,6 @@ pub(super) fn unavailable(provider: Provider, message: &str, fetched_at: u64) ->
     usage
 }
 
-fn setting(name: &str) -> Option<String> {
-    setting_with(name, |name| env::var(name).ok())
-}
-
 fn setting_with(name: &str, lookup: impl Fn(&str) -> Option<String>) -> Option<String> {
     let work_name = format!("WORK_{name}");
     [name, &work_name].into_iter().find_map(|name| {
@@ -140,16 +170,36 @@ fn setting_with(name: &str, lookup: impl Fn(&str) -> Option<String>) -> Option<S
 }
 
 impl Session {
-    pub(super) fn from_env() -> Result<Self, &'static str> {
-        let url = setting(URL_ENV).ok_or("Set LLM_USAGE_CLIPROXY_URL for CLIProxyAPI mode")?;
-        let key =
-            setting(KEY_ENV).ok_or("Set LLM_USAGE_CLIPROXY_MANAGEMENT_KEY for CLIProxyAPI mode")?;
+    pub(super) fn from_env(options: Options) -> Result<Self, &'static str> {
+        Self::from_settings(options, |name| env::var(name).ok())
+    }
+
+    fn from_settings(
+        options: Options,
+        lookup: impl Fn(&str) -> Option<String>,
+    ) -> Result<Self, &'static str> {
+        let setting = |name: &str| setting_with(name, &lookup);
+        // An explicit server never borrows the default key, which may belong to
+        // another server.
+        let (url, key) = if let (Some(url), Some(key_env)) = (options.url, options.key_env) {
+            let key = lookup(&key_env)
+                .map(|key| key.trim().to_owned())
+                .filter(|key| !key.is_empty())
+                .ok_or("The variable named by --cliproxy-key-env is unset or empty")?;
+            (url, key)
+        } else {
+            (
+                setting(URL_ENV).ok_or("Set LLM_USAGE_CLIPROXY_URL for CLIProxyAPI mode")?,
+                setting(KEY_ENV)
+                    .ok_or("Set LLM_USAGE_CLIPROXY_MANAGEMENT_KEY for CLIProxyAPI mode")?,
+            )
+        };
         Self::new(
             &url,
             &key,
-            setting(CODEX_INDEX_ENV),
-            setting(CLAUDE_INDEX_ENV),
-            setting(GO_INDEX_ENV),
+            options.codex.or_else(|| setting(CODEX_INDEX_ENV)),
+            options.claude.or_else(|| setting(CLAUDE_INDEX_ENV)),
+            options.opencode_go.or_else(|| setting(GO_INDEX_ENV)),
             setting(GO_PROVIDER_ENV),
             setting(ACCOUNT_ENV),
         )
@@ -780,13 +830,13 @@ fn select_credential<'a>(
         1 => Ok(candidates.into_iter().next().expect("one credential")),
         _ => Err(match provider {
             Provider::Codex => {
-                "Multiple CLIProxyAPI Codex credentials; set LLM_USAGE_CLIPROXY_CODEX_AUTH_INDEX"
+                "Multiple CLIProxyAPI Codex credentials; pass --codex-auth-index or set LLM_USAGE_CLIPROXY_CODEX_AUTH_INDEX"
             }
             Provider::ClaudeCode => {
-                "Multiple CLIProxyAPI Claude credentials; set LLM_USAGE_CLIPROXY_CLAUDE_AUTH_INDEX"
+                "Multiple CLIProxyAPI Claude credentials; pass --claude-auth-index or set LLM_USAGE_CLIPROXY_CLAUDE_AUTH_INDEX"
             }
             Provider::OpencodeGo => {
-                "Multiple CLIProxyAPI OpenCode Go credentials; set LLM_USAGE_CLIPROXY_OPENCODE_GO_AUTH_INDEX"
+                "Multiple CLIProxyAPI OpenCode Go credentials; pass --opencode-go-auth-index or set LLM_USAGE_CLIPROXY_OPENCODE_GO_AUTH_INDEX"
             }
         }),
     }
@@ -1084,6 +1134,37 @@ mod tests {
             Some("http://canonical:8318")
         );
         assert_eq!(setting_with(KEY_ENV, lookup).as_deref(), Some("TEST_KEY"));
+    }
+
+    #[test]
+    fn explicit_server_uses_only_its_named_key_variable() {
+        let lookup = |name: &str| match name {
+            "LLM_USAGE_CLIPROXY_URL" => Some("http://work:8318".to_owned()),
+            "LLM_USAGE_CLIPROXY_MANAGEMENT_KEY" => Some("WORK_KEY".to_owned()),
+            "PERSONAL_KEY" => Some(" PERSONAL_KEY ".to_owned()),
+            _ => None,
+        };
+        let options = |key_env: &str| Options {
+            url: Some("http://personal:8318".to_owned()),
+            key_env: Some(key_env.to_owned()),
+            ..Options::default()
+        };
+
+        let session = Session::from_settings(options("PERSONAL_KEY"), lookup)
+            .ok()
+            .unwrap();
+        assert_eq!(session.base.host_str(), Some("personal"));
+        assert_eq!(session.authorization, "Bearer PERSONAL_KEY");
+
+        let error = Session::from_settings(options("MISSING_KEY"), lookup)
+            .err()
+            .unwrap();
+        assert!(error.contains("--cliproxy-key-env"));
+
+        let session = Session::from_settings(Options::default(), lookup)
+            .ok()
+            .unwrap();
+        assert_eq!(session.base.host_str(), Some("work"));
     }
 
     #[test]

@@ -89,12 +89,54 @@ server-side. The PoC does not download auth files, request credential refreshes,
 or write provider tokens anywhere. Provider refresh is left to the proxy.
 
 A single enabled matching credential is selected automatically. If multiple
-accounts match, the provider stays unavailable until you select one explicitly:
+accounts match, the provider stays unavailable until you select one explicitly.
+To fetch quotas for a specific account (for example personal or work) without
+changing any login, pass its `auth_index`:
 
 ```sh
-export LLM_USAGE_CLIPROXY_CODEX_AUTH_INDEX='<Codex auth_index>'
-export LLM_USAGE_CLIPROXY_CLAUDE_AUTH_INDEX='<Claude auth_index>'
-export LLM_USAGE_CLIPROXY_OPENCODE_GO_AUTH_INDEX='<Go auth_index>'
+llm-usage json --source cliproxy \
+  --codex-auth-index '<Codex auth_index>' \
+  --claude-auth-index '<Claude auth_index>' \
+  --interval 60 --output ~/.cache/llm-usage/work.json
+```
+
+`--opencode-go-auth-index` selects a Go key the same way. The flags work with
+`watch`, `once`, and `json` (including `--interval`), so run one process per
+account to collect each one independently. They require `--source cliproxy`.
+Each flag overrides its environment variable (`LLM_USAGE_CLIPROXY_CODEX_AUTH_INDEX`,
+`LLM_USAGE_CLIPROXY_CLAUDE_AUTH_INDEX`, `LLM_USAGE_CLIPROXY_OPENCODE_GO_AUTH_INDEX`,
+or their `WORK_` variants). A selected index that is missing, disabled, or for a
+different provider leaves that provider unavailable; another account is never
+used instead. Without the flags or variables, selection is unchanged.
+
+Accounts on another CLIProxyAPI server (for example a personal proxy) are
+selected the same way. Pass the server URL and the **name** of the environment
+variable that holds its management key; the key itself is never accepted as an
+argument:
+
+```sh
+read -rsp 'Personal proxy management key: ' PERSONAL_CLIPROXY_KEY; printf '\n'
+export PERSONAL_CLIPROXY_KEY
+llm-usage json --source cliproxy \
+  --cliproxy-url 'https://personal-proxy.example:8318' \
+  --cliproxy-key-env PERSONAL_CLIPROXY_KEY \
+  --claude-auth-index '<Claude auth_index>' \
+  --interval 60 --output ~/.cache/llm-usage/personal.json
+```
+
+`--cliproxy-url` and `--cliproxy-key-env` must be used together, so a key for one
+server is never sent to another. They override `LLM_USAGE_CLIPROXY_URL` and
+`LLM_USAGE_CLIPROXY_MANAGEMENT_KEY` (and their `WORK_` variants), which are not
+used as a fallback. An unset or empty named variable leaves every provider
+unavailable.
+
+To find the indexes, list the server's credential metadata. This prints only the
+provider type, account email, index, and state, never tokens:
+
+```sh
+curl -sS -H "Authorization: Bearer $LLM_USAGE_CLIPROXY_MANAGEMENT_KEY" \
+  "$LLM_USAGE_CLIPROXY_URL/v8/management/credentials" |
+  jq -c '.files[] | {type, email: (.email // .metadata.email), auth_index, disabled, status}'
 ```
 
 Use the `auth_index` from remote metadata, not the filename or API key. Listed
