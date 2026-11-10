@@ -79,36 +79,22 @@ struct QueryArgs {
     /// Use local credentials or `CLIProxyAPI`'s remote credentials (v8).
     #[arg(long, value_enum, default_value = "local")]
     source: Source,
-    /// Read Codex credentials only from `DIR/auth.json` (Pi or Codex CLI format).
-    #[arg(long, value_name = "DIR")]
-    codex_dir: Option<PathBuf>,
-    /// Read Claude Code credentials only from `DIR/.credentials.json`.
-    #[arg(long, value_name = "DIR")]
-    claude_dir: Option<PathBuf>,
-}
-
-/// Explicitly selected local credential directories. A selected directory is
-/// the only credential source for its provider: no environment overrides,
-/// default paths, or keychain lookups are used as a fallback.
-#[derive(Clone, Default)]
-struct LocalProfile {
-    codex_dir: Option<PathBuf>,
-    claude_dir: Option<PathBuf>,
+    #[command(flatten)]
+    selectors: cliproxy::Selectors,
 }
 
 enum UsageSource {
-    Local(LocalProfile),
+    Local,
     Cliproxy(Result<Box<cliproxy::Session>, &'static str>),
 }
 
 impl UsageSource {
     fn new(query: &QueryArgs) -> Self {
         match query.source {
-            Source::Local => Self::Local(LocalProfile {
-                codex_dir: query.codex_dir.clone(),
-                claude_dir: query.claude_dir.clone(),
-            }),
-            Source::Cliproxy => Self::Cliproxy(cliproxy::Session::from_env().map(Box::new)),
+            Source::Local => Self::Local,
+            Source::Cliproxy => {
+                Self::Cliproxy(cliproxy::Session::from_env(query.selectors.clone()).map(Box::new))
+            }
         }
     }
 }
@@ -361,12 +347,12 @@ where
         None => None,
     };
     if let Some(query) = query
-        && matches!(query.source, Source::Cliproxy)
-        && (query.codex_dir.is_some() || query.claude_dir.is_some())
+        && matches!(query.source, Source::Local)
+        && query.selectors.any()
     {
         return Err(Cli::command().error(
-            ErrorKind::ArgumentConflict,
-            "--codex-dir and --claude-dir select local credentials and cannot be used with --source cliproxy",
+            ErrorKind::MissingRequiredArgument,
+            "--codex-auth-index, --claude-auth-index, and --opencode-go-auth-index require --source cliproxy",
         ));
     }
     Ok(cli)
@@ -577,23 +563,20 @@ fn fetch_snapshot(requested: &[Provider], source: &mut UsageSource) -> Snapshot 
         requested.to_vec()
     };
     let fetched_at = now();
-    let profile = match source {
-        UsageSource::Local(profile) => profile,
-        UsageSource::Cliproxy(session) => {
-            let providers = match session {
-                Ok(session) => session.fetch(&providers, fetched_at),
-                Err(error) => providers
-                    .into_iter()
-                    .map(|provider| cliproxy::unavailable(provider, error, fetched_at))
-                    .collect(),
-            };
-            return Snapshot {
-                schema_version: JSON_SCHEMA_VERSION,
-                fetched_at,
-                providers,
-            };
-        }
-    };
+    if let UsageSource::Cliproxy(session) = source {
+        let providers = match session {
+            Ok(session) => session.fetch(&providers, fetched_at),
+            Err(error) => providers
+                .into_iter()
+                .map(|provider| cliproxy::unavailable(provider, error, fetched_at))
+                .collect(),
+        };
+        return Snapshot {
+            schema_version: JSON_SCHEMA_VERSION,
+            fetched_at,
+            providers,
+        };
+    }
     let client = Client::builder()
         .timeout(Duration::from_secs(15))
         .user_agent(concat!("llm-usage/", env!("CARGO_PKG_VERSION")))
@@ -606,11 +589,9 @@ fn fetch_snapshot(requested: &[Provider], source: &mut UsageSource) -> Snapshot 
         providers: providers
             .into_iter()
             .map(|provider| match provider {
-                Provider::Codex => fetch_codex(&client, profile.codex_dir.as_deref(), fetched_at),
+                Provider::Codex => fetch_codex(&client, fetched_at),
                 Provider::OpencodeGo => fetch_opencode_go(&client, fetched_at),
-                Provider::ClaudeCode => {
-                    fetch_claude_code(&client, profile.claude_dir.as_deref(), fetched_at)
-                }
+                Provider::ClaudeCode => fetch_claude_code(&client, fetched_at),
             })
             .collect(),
     }
@@ -629,14 +610,13 @@ fn unavailable(provider: Provider, error: impl Into<String>, fetched_at: u64) ->
     }
 }
 
-fn fetch_codex(client: &Client, codex_dir: Option<&Path>, fetched_at: u64) -> ProviderUsage {
-    let credentials = match codex_dir {
-        Some(dir) => codex_profile_credentials(dir),
-        None => codex_credentials().ok_or_else(|| "Codex OAuth credential not found".to_owned()),
-    };
-    let (access, account_id) = match credentials {
-        Ok(credentials) => credentials,
-        Err(error) => return unavailable(Provider::Codex, error, fetched_at),
+fn fetch_codex(client: &Client, fetched_at: u64) -> ProviderUsage {
+    let Some((access, account_id)) = codex_credentials() else {
+        return unavailable(
+            Provider::Codex,
+            "Codex OAuth credential not found",
+            fetched_at,
+        );
     };
     let mut request = client
         .get(CODEX_USAGE_URL)
@@ -789,31 +769,6 @@ fn codex_credentials() -> Option<(String, Option<String>)> {
     None
 }
 
-fn codex_profile_credentials(dir: &Path) -> Result<(String, Option<String>), String> {
-    let path = dir.join("auth.json");
-    let data = read_profile_json(&path, "Codex")?;
-    pi_codex_credentials(&data)
-        .or_else(|| codex_cli_credentials(&data))
-        .ok_or_else(|| format!("Codex OAuth credential not found in {}", path.display()))
-}
-
-/// Reads a selected profile's credential file, reporting why it is unusable
-/// without exposing its contents.
-fn read_profile_json(path: &Path, provider: &str) -> Result<Value, String> {
-    let content = fs::read_to_string(path).map_err(|error| match error.kind() {
-        io::ErrorKind::NotFound => {
-            format!("{provider} credential file not found: {}", path.display())
-        }
-        _ => format!("{provider} credential file unreadable: {}", path.display()),
-    })?;
-    serde_json::from_str(&content).map_err(|_| {
-        format!(
-            "{provider} credential file is not valid JSON: {}",
-            path.display()
-        )
-    })
-}
-
 fn codex_auth_paths() -> Vec<PathBuf> {
     let mut paths = vec![];
     if let Some(path) = env::var_os("LLM_USAGE_CODEX_AUTH_FILE") {
@@ -874,17 +829,15 @@ fn codex_cli_credentials(data: &Value) -> Option<(String, Option<String>)> {
     ))
 }
 
-fn fetch_claude_code(client: &Client, claude_dir: Option<&Path>, fetched_at: u64) -> ProviderUsage {
-    let credentials = match claude_dir {
-        Some(dir) => claude_code_profile_credentials(dir),
-        None => claude_code_credentials()
-            .ok_or_else(|| "Claude Code OAuth credential not found".to_owned()),
+fn fetch_claude_code(client: &Client, fetched_at: u64) -> ProviderUsage {
+    let Some((access_token, plan)) = claude_code_credentials() else {
+        return unavailable(
+            Provider::ClaudeCode,
+            "Claude Code OAuth credential not found",
+            fetched_at,
+        );
     };
-    let (access_token, plan) = match credentials {
-        Ok(credentials) => credentials,
-        Err(error) => return unavailable(Provider::ClaudeCode, error, fetched_at),
-    };
-    let cache_path = claude_code_cache_path(claude_dir);
+    let cache_path = claude_code_cache_path();
     let cache = cache_path.as_deref().and_then(read_claude_code_cache);
     if let Some(cache) = cache.as_ref()
         && claude_code_cache_throttled(cache, fetched_at)
@@ -1110,31 +1063,12 @@ fn cached_claude_code_usage(
     })
 }
 
-/// Each selected profile gets its own cache so one account's usage is never
-/// shown for another.
-fn claude_code_cache_path(claude_dir: Option<&Path>) -> Option<PathBuf> {
-    let name = claude_dir.map_or_else(
-        || "claude-code.json".to_owned(),
-        |dir| {
-            format!(
-                "claude-code-{:016x}.json",
-                fnv1a(dir.as_os_str().as_encoded_bytes())
-            )
-        },
-    );
+fn claude_code_cache_path() -> Option<PathBuf> {
     env::var_os("XDG_CACHE_HOME")
         .filter(|path| !path.is_empty())
         .map(PathBuf::from)
         .or_else(|| home_dir().map(|home| home.join(".cache")))
-        .map(|root| root.join("llm-usage").join(name))
-}
-
-/// Stable 64-bit FNV-1a hash, unlike `DefaultHasher`, so cache names survive
-/// toolchain upgrades.
-fn fnv1a(bytes: &[u8]) -> u64 {
-    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
-        (hash ^ u64::from(*byte)).wrapping_mul(0x0100_0000_01b3)
-    })
+        .map(|root| root.join("llm-usage/claude-code.json"))
 }
 
 fn read_claude_code_cache(path: &Path) -> Option<ClaudeCodeCache> {
@@ -1247,17 +1181,6 @@ fn claude_code_credentials() -> Option<(String, Option<String>)> {
         return Some(creds);
     }
     None
-}
-
-fn claude_code_profile_credentials(dir: &Path) -> Result<(String, Option<String>), String> {
-    let path = dir.join(".credentials.json");
-    let data = read_profile_json(&path, "Claude Code")?;
-    claude_code_oauth_credentials(&data).ok_or_else(|| {
-        format!(
-            "Claude Code OAuth credential not found in {}",
-            path.display()
-        )
-    })
 }
 
 fn claude_code_keychain_credentials() -> Option<(String, Option<String>)> {
@@ -3149,93 +3072,38 @@ mod tests {
     }
 
     #[test]
-    fn profile_credentials_read_only_the_selected_directory() {
-        let directory =
-            env::temp_dir().join(format!("llm-usage-profile-test-{}", std::process::id()));
-        fs::create_dir_all(&directory).unwrap();
-        let missing_codex = codex_profile_credentials(&directory).unwrap_err();
-        let missing_claude = claude_code_profile_credentials(&directory).unwrap_err();
-
-        fs::write(directory.join("auth.json"), "not json").unwrap();
-        let invalid_codex = codex_profile_credentials(&directory).unwrap_err();
-        fs::write(directory.join(".credentials.json"), r#"{"other": {}}"#).unwrap();
-        let empty_claude = claude_code_profile_credentials(&directory).unwrap_err();
-
-        fs::write(
-            directory.join("auth.json"),
-            r#"{"tokens": {"access_token": "codex-token", "account_id": "account"}}"#,
-        )
-        .unwrap();
-        fs::write(
-            directory.join(".credentials.json"),
-            r#"{"claudeAiOauth": {"accessToken": "claude-token", "subscriptionType": "max"}}"#,
-        )
-        .unwrap();
-        let codex = codex_profile_credentials(&directory).unwrap();
-        let claude = claude_code_profile_credentials(&directory).unwrap();
-        fs::remove_dir_all(&directory).unwrap();
-
-        assert!(missing_codex.starts_with("Codex credential file not found: "));
-        assert!(missing_codex.ends_with("auth.json"));
-        assert!(missing_claude.starts_with("Claude Code credential file not found: "));
-        assert!(invalid_codex.starts_with("Codex credential file is not valid JSON: "));
-        assert!(empty_claude.starts_with("Claude Code OAuth credential not found in "));
-        assert_eq!(
-            codex,
-            ("codex-token".to_owned(), Some("account".to_owned()))
-        );
-        assert_eq!(claude, ("claude-token".to_owned(), Some("max".to_owned())));
-    }
-
-    #[test]
-    fn claude_code_cache_is_isolated_per_profile() {
-        let default = claude_code_cache_path(None).unwrap();
-        let work = claude_code_cache_path(Some(Path::new("/profiles/work"))).unwrap();
-        let personal = claude_code_cache_path(Some(Path::new("/profiles/personal"))).unwrap();
-
-        assert_eq!(default.file_name().unwrap(), "claude-code.json");
-        assert_ne!(work, personal);
-        assert_ne!(work, default);
-        assert_eq!(
-            work,
-            claude_code_cache_path(Some(Path::new("/profiles/work"))).unwrap()
-        );
-    }
-
-    #[test]
-    fn profile_directories_parse_and_reject_cliproxy() {
+    fn cliproxy_auth_index_flags_require_cliproxy_source() {
         let cli = parse_cli([
             "llm-usage",
             "json",
-            "--codex-dir",
-            "/profiles/work/pi",
-            "--claude-dir",
-            "/profiles/work/claude",
+            "--source",
+            "cliproxy",
+            "--codex-auth-index",
+            "codex-work",
+            "--claude-auth-index",
+            "claude-work",
         ])
         .unwrap();
         let Some(Command::Json(args)) = cli.command else {
             panic!("expected JSON command")
         };
-        assert_eq!(
-            args.query.codex_dir.as_deref(),
-            Some(Path::new("/profiles/work/pi"))
-        );
-        assert_eq!(
-            args.query.claude_dir.as_deref(),
-            Some(Path::new("/profiles/work/claude"))
-        );
+        assert!(args.query.selectors.any());
 
-        let error = parse_cli([
-            "llm-usage",
-            "once",
-            "--source",
-            "cliproxy",
-            "--claude-dir",
-            "/profiles/work/claude",
-        ])
-        .err()
-        .unwrap();
-        assert_eq!(error.kind(), ErrorKind::ArgumentConflict);
+        let error = parse_cli(["llm-usage", "once", "--claude-auth-index", "claude-work"])
+            .err()
+            .unwrap();
+        assert_eq!(error.kind(), ErrorKind::MissingRequiredArgument);
+        assert!(
+            parse_cli([
+                "llm-usage",
+                "watch",
+                "--source",
+                "cliproxy",
+                "--codex-auth-index",
+                "",
+            ])
+            .is_err()
+        );
     }
 
     #[test]

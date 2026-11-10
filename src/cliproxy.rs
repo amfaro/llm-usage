@@ -3,6 +3,7 @@
 use std::{collections::HashMap, env, time::Duration};
 
 use chrono::Utc;
+use clap::{Args, builder::NonEmptyStringValueParser};
 use reqwest::{StatusCode, Url, blocking::Client, header::HeaderValue, redirect::Policy};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -52,6 +53,28 @@ struct GoDiscovery {
     refresh_after: u64,
     // Only sanitized metadata or constant, redacted failure messages survive.
     result: Result<Vec<Value>, Failure>,
+}
+
+/// Command-line credential selectors. Each one takes precedence over its
+/// environment variable and must match a listed credential; there is no fallback
+/// to another account.
+#[derive(Args, Clone, Default)]
+pub(super) struct Selectors {
+    /// `CLIProxyAPI` `auth_index` of the Codex credential to use.
+    #[arg(long = "codex-auth-index", value_name = "INDEX", value_parser = NonEmptyStringValueParser::new())]
+    codex: Option<String>,
+    /// `CLIProxyAPI` `auth_index` of the Claude credential to use.
+    #[arg(long = "claude-auth-index", value_name = "INDEX", value_parser = NonEmptyStringValueParser::new())]
+    claude: Option<String>,
+    /// `CLIProxyAPI` `auth_index` of the `OpenCode` Go key to use.
+    #[arg(long = "opencode-go-auth-index", value_name = "INDEX", value_parser = NonEmptyStringValueParser::new())]
+    opencode_go: Option<String>,
+}
+
+impl Selectors {
+    pub(super) fn any(&self) -> bool {
+        self.codex.is_some() || self.claude.is_some() || self.opencode_go.is_some()
+    }
 }
 
 pub(super) struct Session {
@@ -140,16 +163,16 @@ fn setting_with(name: &str, lookup: impl Fn(&str) -> Option<String>) -> Option<S
 }
 
 impl Session {
-    pub(super) fn from_env() -> Result<Self, &'static str> {
+    pub(super) fn from_env(selectors: Selectors) -> Result<Self, &'static str> {
         let url = setting(URL_ENV).ok_or("Set LLM_USAGE_CLIPROXY_URL for CLIProxyAPI mode")?;
         let key =
             setting(KEY_ENV).ok_or("Set LLM_USAGE_CLIPROXY_MANAGEMENT_KEY for CLIProxyAPI mode")?;
         Self::new(
             &url,
             &key,
-            setting(CODEX_INDEX_ENV),
-            setting(CLAUDE_INDEX_ENV),
-            setting(GO_INDEX_ENV),
+            selectors.codex.or_else(|| setting(CODEX_INDEX_ENV)),
+            selectors.claude.or_else(|| setting(CLAUDE_INDEX_ENV)),
+            selectors.opencode_go.or_else(|| setting(GO_INDEX_ENV)),
             setting(GO_PROVIDER_ENV),
             setting(ACCOUNT_ENV),
         )
@@ -780,13 +803,13 @@ fn select_credential<'a>(
         1 => Ok(candidates.into_iter().next().expect("one credential")),
         _ => Err(match provider {
             Provider::Codex => {
-                "Multiple CLIProxyAPI Codex credentials; set LLM_USAGE_CLIPROXY_CODEX_AUTH_INDEX"
+                "Multiple CLIProxyAPI Codex credentials; pass --codex-auth-index or set LLM_USAGE_CLIPROXY_CODEX_AUTH_INDEX"
             }
             Provider::ClaudeCode => {
-                "Multiple CLIProxyAPI Claude credentials; set LLM_USAGE_CLIPROXY_CLAUDE_AUTH_INDEX"
+                "Multiple CLIProxyAPI Claude credentials; pass --claude-auth-index or set LLM_USAGE_CLIPROXY_CLAUDE_AUTH_INDEX"
             }
             Provider::OpencodeGo => {
-                "Multiple CLIProxyAPI OpenCode Go credentials; set LLM_USAGE_CLIPROXY_OPENCODE_GO_AUTH_INDEX"
+                "Multiple CLIProxyAPI OpenCode Go credentials; pass --opencode-go-auth-index or set LLM_USAGE_CLIPROXY_OPENCODE_GO_AUTH_INDEX"
             }
         }),
     }

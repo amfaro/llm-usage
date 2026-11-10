@@ -89,12 +89,33 @@ server-side. The PoC does not download auth files, request credential refreshes,
 or write provider tokens anywhere. Provider refresh is left to the proxy.
 
 A single enabled matching credential is selected automatically. If multiple
-accounts match, the provider stays unavailable until you select one explicitly:
+accounts match, the provider stays unavailable until you select one explicitly.
+To fetch quotas for a specific account (for example personal or work) without
+changing any login, pass its `auth_index`:
 
 ```sh
-export LLM_USAGE_CLIPROXY_CODEX_AUTH_INDEX='<Codex auth_index>'
-export LLM_USAGE_CLIPROXY_CLAUDE_AUTH_INDEX='<Claude auth_index>'
-export LLM_USAGE_CLIPROXY_OPENCODE_GO_AUTH_INDEX='<Go auth_index>'
+llm-usage json --source cliproxy \
+  --codex-auth-index '<Codex auth_index>' \
+  --claude-auth-index '<Claude auth_index>' \
+  --interval 60 --output ~/.cache/llm-usage/work.json
+```
+
+`--opencode-go-auth-index` selects a Go key the same way. The flags work with
+`watch`, `once`, and `json` (including `--interval`), so run one process per
+account to collect each one independently. They require `--source cliproxy`.
+Each flag overrides its environment variable (`LLM_USAGE_CLIPROXY_CODEX_AUTH_INDEX`,
+`LLM_USAGE_CLIPROXY_CLAUDE_AUTH_INDEX`, `LLM_USAGE_CLIPROXY_OPENCODE_GO_AUTH_INDEX`,
+or their `WORK_` variants). A selected index that is missing, disabled, or for a
+different provider leaves that provider unavailable; another account is never
+used instead. Without the flags or variables, selection is unchanged.
+
+To find the indexes, list the server's credential metadata. This prints only the
+provider type, account email, index, and state, never tokens:
+
+```sh
+curl -sS -H "Authorization: Bearer $LLM_USAGE_CLIPROXY_MANAGEMENT_KEY" \
+  "$LLM_USAGE_CLIPROXY_URL/v8/management/credentials" |
+  jq -c '.files[] | {type, email: (.email // .metadata.email), auth_index, disabled, status}'
 ```
 
 Use the `auth_index` from remote metadata, not the filename or API key. Listed
@@ -260,32 +281,6 @@ export OPENCODE_GO_API_KEY='your-opencode-go-api-key'
 ```
 
 The API key is sent as a `Bearer` token to `GET https://opencode.ai/zen/go/v1/usage`.
-
-### Profiles
-
-To read quotas for a specific account without changing your active login, select
-its credential directory explicitly:
-
-```sh
-llm-usage json --codex-dir ~/.pi/agent-work --claude-dir ~/.config/claude-work
-llm-usage json --claude-dir ~/.claude-personal --provider claude-code \
-  --interval 60 --output ~/.cache/llm-usage/personal.json
-```
-
-- `--codex-dir DIR` reads only `DIR/auth.json` (Pi or Codex CLI format), such as a
-  `PI_CODING_AGENT_DIR` or `CODEX_HOME`.
-- `--claude-dir DIR` reads only `DIR/.credentials.json`, such as a
-  `CLAUDE_CONFIG_DIR`.
-
-A selected directory is the only credential source for that provider. The
-`LLM_USAGE_*` token and auth-file variables, default paths, and the macOS Keychain
-are not consulted, and there is no fallback to another account. A missing,
-unreadable, or invalid file leaves the provider unavailable with an error naming
-the file. Each selected Claude directory has its own usage cache. OpenCode Go
-still uses `OPENCODE_GO_API_KEY`. Both flags work with `watch`, `once`, and `json`
-(including `--interval`), so run one process per profile to collect them
-independently. They cannot be combined with `--source cliproxy`. Without these
-flags, lookup is unchanged.
 
 ## Exit status
 
