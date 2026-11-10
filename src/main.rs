@@ -80,7 +80,7 @@ struct QueryArgs {
     #[arg(long, value_enum, default_value = "local")]
     source: Source,
     #[command(flatten)]
-    selectors: cliproxy::Selectors,
+    cliproxy: cliproxy::Options,
 }
 
 enum UsageSource {
@@ -93,7 +93,7 @@ impl UsageSource {
         match query.source {
             Source::Local => Self::Local,
             Source::Cliproxy => {
-                Self::Cliproxy(cliproxy::Session::from_env(query.selectors.clone()).map(Box::new))
+                Self::Cliproxy(cliproxy::Session::from_env(query.cliproxy.clone()).map(Box::new))
             }
         }
     }
@@ -348,11 +348,11 @@ where
     };
     if let Some(query) = query
         && matches!(query.source, Source::Local)
-        && query.selectors.any()
+        && query.cliproxy.any()
     {
         return Err(Cli::command().error(
             ErrorKind::MissingRequiredArgument,
-            "--codex-auth-index, --claude-auth-index, and --opencode-go-auth-index require --source cliproxy",
+            "--cliproxy-url, --cliproxy-key-env, and the --*-auth-index flags require --source cliproxy",
         ));
     }
     Ok(cli)
@@ -3087,7 +3087,26 @@ mod tests {
         let Some(Command::Json(args)) = cli.command else {
             panic!("expected JSON command")
         };
-        assert!(args.query.selectors.any());
+        assert!(args.query.cliproxy.any());
+
+        assert!(
+            parse_cli([
+                "llm-usage",
+                "json",
+                "--source",
+                "cliproxy",
+                "--cliproxy-url",
+                "http://personal:8318",
+                "--cliproxy-key-env",
+                "PERSONAL_KEY",
+            ])
+            .is_ok()
+        );
+        for flag in ["--cliproxy-url", "--cliproxy-key-env"] {
+            assert!(
+                parse_cli(["llm-usage", "once", "--source", "cliproxy", flag, "value"]).is_err()
+            );
+        }
 
         let error = parse_cli(["llm-usage", "once", "--claude-auth-index", "claude-work"])
             .err()

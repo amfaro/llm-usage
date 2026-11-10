@@ -109,6 +109,27 @@ or their `WORK_` variants). A selected index that is missing, disabled, or for a
 different provider leaves that provider unavailable; another account is never
 used instead. Without the flags or variables, selection is unchanged.
 
+Accounts on another CLIProxyAPI server (for example a personal proxy) are
+selected the same way. Pass the server URL and the **name** of the environment
+variable that holds its management key; the key itself is never accepted as an
+argument:
+
+```sh
+read -rsp 'Personal proxy management key: ' PERSONAL_CLIPROXY_KEY; printf '\n'
+export PERSONAL_CLIPROXY_KEY
+llm-usage json --source cliproxy \
+  --cliproxy-url 'https://personal-proxy.example:8318' \
+  --cliproxy-key-env PERSONAL_CLIPROXY_KEY \
+  --claude-auth-index '<Claude auth_index>' \
+  --interval 60 --output ~/.cache/llm-usage/personal.json
+```
+
+`--cliproxy-url` and `--cliproxy-key-env` must be used together, so a key for one
+server is never sent to another. They override `LLM_USAGE_CLIPROXY_URL` and
+`LLM_USAGE_CLIPROXY_MANAGEMENT_KEY` (and their `WORK_` variants), which are not
+used as a fallback. An unset or empty named variable leaves every provider
+unavailable.
+
 To find the indexes, list the server's credential metadata. This prints only the
 provider type, account email, index, and state, never tokens:
 
