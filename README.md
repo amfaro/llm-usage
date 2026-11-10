@@ -261,6 +261,32 @@ export OPENCODE_GO_API_KEY='your-opencode-go-api-key'
 
 The API key is sent as a `Bearer` token to `GET https://opencode.ai/zen/go/v1/usage`.
 
+### Profiles
+
+To read quotas for a specific account without changing your active login, select
+its credential directory explicitly:
+
+```sh
+llm-usage json --codex-dir ~/.pi/agent-work --claude-dir ~/.config/claude-work
+llm-usage json --claude-dir ~/.claude-personal --provider claude-code \
+  --interval 60 --output ~/.cache/llm-usage/personal.json
+```
+
+- `--codex-dir DIR` reads only `DIR/auth.json` (Pi or Codex CLI format), such as a
+  `PI_CODING_AGENT_DIR` or `CODEX_HOME`.
+- `--claude-dir DIR` reads only `DIR/.credentials.json`, such as a
+  `CLAUDE_CONFIG_DIR`.
+
+A selected directory is the only credential source for that provider. The
+`LLM_USAGE_*` token and auth-file variables, default paths, and the macOS Keychain
+are not consulted, and there is no fallback to another account. A missing,
+unreadable, or invalid file leaves the provider unavailable with an error naming
+the file. Each selected Claude directory has its own usage cache. OpenCode Go
+still uses `OPENCODE_GO_API_KEY`. Both flags work with `watch`, `once`, and `json`
+(including `--interval`), so run one process per profile to collect them
+independently. They cannot be combined with `--source cliproxy`. Without these
+flags, lookup is unchanged.
+
 ## Exit status
 
 `once` and `json` exit `0` when at least one selected provider returns usage, otherwise `1`. `json --output` also exits `1` when the file cannot be written. Unavailable providers remain in text and JSON output with a redacted error. `watch` and `json --interval` keep retrying on later refreshes.
