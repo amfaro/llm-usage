@@ -1,3 +1,4 @@
+# Inlined: this public repo cannot use the private amfaro/actions.
 name: dependabot-auto-merge
 on:
   pull_request:
@@ -11,5 +12,19 @@ jobs:
   dependabot:
     runs-on: blacksmith-4vcpu-ubuntu-2404
     if: ${{ github.actor == 'dependabot[bot]' }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      PR_URL: ${{ github.event.pull_request.html_url }}
     steps:
-      - uses: amfaro/actions/dependabot-auto-merge@v1
+      - id: metadata
+        uses: dependabot/fetch-metadata@v3
+
+      - name: Approve
+        run: gh pr review --approve "$PR_URL"
+
+      # Required checks still gate the merge.
+      - name: Enable auto-merge for patch and minor updates
+        if: >-
+          steps.metadata.outputs.update-type == 'version-update:semver-patch' ||
+          steps.metadata.outputs.update-type == 'version-update:semver-minor'
+        run: gh pr merge --auto --squash "$PR_URL"
