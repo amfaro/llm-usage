@@ -10,9 +10,9 @@ use serde_json::{Value, json};
 
 use super::{
     CLAUDE_CODE_RATE_LIMIT_COOLDOWN, CLAUDE_CODE_REFRESH_INTERVAL, CLAUDE_CODE_USAGE_URL,
-    CODEX_USAGE_URL, ClaudeCodeCache, ClaudeCodeCooldown, OPENCODE_GO_USAGE_URL, Provider,
-    ProviderUsage, cached_claude_code_usage, claude_code_retry_after, claude_code_windows,
-    codex_windows, opencode_api_windows, provider_status,
+    CODEX_USAGE_URL, ClaudeCodeCache, ClaudeCodeCooldown, GEMINI_QUOTA_URLS, OPENCODE_GO_USAGE_URL,
+    Provider, ProviderUsage, cached_claude_code_usage, claude_code_retry_after,
+    claude_code_windows, codex_windows, gemini_windows, opencode_api_windows, provider_status,
 };
 
 const SOURCE: &str = "cliproxy";
@@ -21,12 +21,16 @@ const KEY_ENV: &str = "LLM_USAGE_CLIPROXY_MANAGEMENT_KEY";
 const CODEX_INDEX_ENV: &str = "LLM_USAGE_CLIPROXY_CODEX_AUTH_INDEX";
 const CLAUDE_INDEX_ENV: &str = "LLM_USAGE_CLIPROXY_CLAUDE_AUTH_INDEX";
 const GO_INDEX_ENV: &str = "LLM_USAGE_CLIPROXY_OPENCODE_GO_AUTH_INDEX";
+const GEMINI_INDEX_ENV: &str = "LLM_USAGE_CLIPROXY_GEMINI_AUTH_INDEX";
 const GO_PROVIDER_ENV: &str = "LLM_USAGE_CLIPROXY_OPENCODE_GO_PROVIDER";
 const ACCOUNT_ENV: &str = "LLM_USAGE_CLIPROXY_CODEX_ACCOUNT_ID";
 const INVALID_RESPONSE: &str = "CLIProxyAPI management response was invalid";
 const GO_CONFIG_PATH: &str = "config/api-keys/openai-compatibility";
 const GO_DISCOVERY_INTERVAL: u64 = 300;
 const GO_BASE_URL: &str = "https://opencode.ai/zen/go/v1";
+// Cloud Code rejects newer models for older clients; keep aligned with
+// CLIProxyAPI's Antigravity hub user agent.
+const ANTIGRAVITY_USER_AGENT: &str = "antigravity/hub/2.23.0 darwin/arm64";
 
 // Deliberately omit api-key, headers, proxy-url, and arbitrary server text. Serde
 // ignores those fields instead of materializing them in a retained Value/string.
@@ -76,6 +80,9 @@ pub(super) struct Options {
     /// `CLIProxyAPI` `auth_index` of the `OpenCode` Go key to use.
     #[arg(long = "opencode-go-auth-index", value_name = "INDEX", value_parser = NonEmptyStringValueParser::new())]
     opencode_go: Option<String>,
+    /// `CLIProxyAPI` `auth_index` of the Gemini (Antigravity) credential to use.
+    #[arg(long = "gemini-auth-index", value_name = "INDEX", value_parser = NonEmptyStringValueParser::new())]
+    gemini: Option<String>,
 }
 
 impl Options {
@@ -85,6 +92,7 @@ impl Options {
             || self.codex.is_some()
             || self.claude.is_some()
             || self.opencode_go.is_some()
+            || self.gemini.is_some()
     }
 }
 
@@ -95,6 +103,7 @@ pub(super) struct Session {
     codex_index: Option<String>,
     claude_index: Option<String>,
     go_index: Option<String>,
+    gemini_index: Option<String>,
     go_provider: String,
     codex_account: Option<String>,
     // Isolated per session/server and remote credential identity, never written to disk.
@@ -200,17 +209,23 @@ impl Session {
             options.codex.or_else(|| setting(CODEX_INDEX_ENV)),
             options.claude.or_else(|| setting(CLAUDE_INDEX_ENV)),
             options.opencode_go.or_else(|| setting(GO_INDEX_ENV)),
+            options.gemini.or_else(|| setting(GEMINI_INDEX_ENV)),
             setting(GO_PROVIDER_ENV),
             setting(ACCOUNT_ENV),
         )
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one optional selector per provider keeps call sites explicit"
+    )]
     fn new(
         url: &str,
         key: &str,
         codex_index: Option<String>,
         claude_index: Option<String>,
         go_index: Option<String>,
+        gemini_index: Option<String>,
         go_provider: Option<String>,
         codex_account: Option<String>,
     ) -> Result<Self, &'static str> {
@@ -247,6 +262,7 @@ impl Session {
             codex_index,
             claude_index,
             go_index,
+            gemini_index,
             go_provider: go_provider.unwrap_or_else(|| Provider::OpencodeGo.name().to_owned()),
             codex_account,
             claude_cache: HashMap::new(),
@@ -299,6 +315,7 @@ impl Session {
                     Provider::Codex => self.codex_index.as_deref(),
                     Provider::ClaudeCode => self.claude_index.as_deref(),
                     Provider::OpencodeGo => self.go_index.as_deref(),
+                    Provider::Gemini => self.gemini_index.as_deref(),
                 };
                 let (file, index) =
                     match select_credential(files, provider, selector, &self.go_provider) {
@@ -439,6 +456,9 @@ impl Session {
         file: &Value,
         index: &str,
     ) -> Result<Value, Failure> {
+        if matches!(provider, Provider::Gemini) {
+            return self.request_gemini_usage(file, index);
+        }
         let mut header = json!({"Authorization": "Bearer $TOKEN$", "Accept": "application/json"});
         let url = match provider {
             Provider::Codex => {
@@ -452,6 +472,7 @@ impl Session {
                 CLAUDE_CODE_USAGE_URL
             }
             Provider::OpencodeGo => OPENCODE_GO_USAGE_URL,
+            Provider::Gemini => unreachable!("Gemini uses request_gemini_usage"),
         };
         let response = self
             .client
@@ -471,6 +492,45 @@ impl Session {
             .json()
             .map_err(|_| Failure::transient(INVALID_RESPONSE))?;
         parse_envelope(&envelope)
+    }
+
+    // Antigravity quota is a POST per project. Hosts are tried in order until one
+    // reports Gemini buckets; the proxy substitutes and refreshes the OAuth token.
+    fn request_gemini_usage(&self, file: &Value, index: &str) -> Result<Value, Failure> {
+        let project = project_id(file).ok_or_else(|| {
+            Failure::transient("CLIProxyAPI Antigravity credential metadata lacks a project_id")
+        })?;
+        let header = json!({
+            "Authorization": "Bearer $TOKEN$",
+            "Content-Type": "application/json",
+            "User-Agent": ANTIGRAVITY_USER_AGENT,
+        });
+        let data = json!({"project": project}).to_string();
+        let mut last = Failure::transient("CLIProxyAPI Gemini quota request failed");
+        for url in GEMINI_QUOTA_URLS {
+            let response = self
+                .client
+                .post(self.base.join("requests/api-call").expect("fixed API path"))
+                .header("Authorization", self.authorization.clone())
+                .json(&json!({"authIndex": index, "method": "POST", "url": url,
+                    "header": header, "data": data}))
+                .send()
+                .map_err(|_| Failure::transient("CLIProxyAPI quota request failed"))?;
+            // Management-level failures apply to every host; stop immediately.
+            check_management_response(&response)?;
+            let envelope: Value = response
+                .json()
+                .map_err(|_| Failure::transient(INVALID_RESPONSE))?;
+            match parse_envelope(&envelope) {
+                Ok(data) if !gemini_windows(&data).is_empty() => return Ok(data),
+                Ok(_) => {
+                    last =
+                        Failure::transient("CLIProxyAPI Antigravity quota has no Gemini buckets");
+                }
+                Err(failure) => last = failure,
+            }
+        }
+        Err(last)
     }
 
     fn fetch_provider(
@@ -631,6 +691,7 @@ fn usage_from_data(
         Provider::Codex => codex_windows(data),
         Provider::ClaudeCode => claude_code_windows(data),
         Provider::OpencodeGo => opencode_api_windows(data),
+        Provider::Gemini => gemini_windows(data),
     };
     // The existing parsers may retain an unavailable 5h placeholder even for malformed data.
     if !windows.iter().any(|window| window.used_percent.is_some()) {
@@ -795,6 +856,9 @@ fn select_credential<'a>(
                         name.eq_ignore_ascii_case("claude")
                             || name.eq_ignore_ascii_case("anthropic")
                     }
+                    // Gemini models are reached through the proxy's Antigravity
+                    // OAuth credential; Gemini CLI and API-key types differ.
+                    Provider::Gemini => name.eq_ignore_ascii_case("antigravity"),
                     Provider::OpencodeGo => false,
                 })
         })
@@ -838,6 +902,9 @@ fn select_credential<'a>(
             Provider::OpencodeGo => {
                 "Multiple CLIProxyAPI OpenCode Go credentials; pass --opencode-go-auth-index or set LLM_USAGE_CLIPROXY_OPENCODE_GO_AUTH_INDEX"
             }
+            Provider::Gemini => {
+                "Multiple CLIProxyAPI Antigravity credentials; pass --gemini-auth-index or set LLM_USAGE_CLIPROXY_GEMINI_AUTH_INDEX"
+            }
         }),
     }
 }
@@ -872,6 +939,20 @@ fn credential_identity(file: &Value, index: &str) -> String {
         }
     }
     Value::Array(identity).to_string()
+}
+
+fn project_id(file: &Value) -> Option<String> {
+    for root in [Some(file), file.get("metadata"), file.get("attributes")]
+        .into_iter()
+        .flatten()
+    {
+        for key in ["project_id", "projectId", "gemini_virtual_project"] {
+            if let Some(id) = identifier(root.get(key)) {
+                return Some(id);
+            }
+        }
+    }
+    None
 }
 
 fn account_id(file: &Value) -> Option<String> {
@@ -991,6 +1072,7 @@ mod tests {
             Session::new(
                 &self.url,
                 "TEST_MANAGEMENT_KEY",
+                None,
                 None,
                 None,
                 None,
@@ -1228,6 +1310,108 @@ mod tests {
         assert!(!requests[1].body.to_string().contains("TEST_MANAGEMENT_KEY"));
     }
 
+    fn antigravity_credential(index: &str) -> Reply {
+        Reply::json(json!({"files": [
+            {"type": "codex", "auth_index": "codex-1"},
+            {"type": "antigravity", "name": "antigravity-personal.json", "auth_index": index,
+                "email": "personal@example.com", "project_id": "test-project-1"}
+        ]}))
+    }
+
+    fn antigravity_data(gemini: bool) -> Value {
+        let mut groups = vec![json!({"displayName": "Claude and GPT", "buckets": [
+            {"bucketId": "claude-5h", "window": "5h", "remainingFraction": 0.0,
+                "resetTime": "2026-10-10T12:00:00Z"}
+        ]})];
+        if gemini {
+            groups.push(json!({"displayName": "Gemini", "buckets": [
+                {"bucketId": "gemini-pro-5h", "window": "5h", "remainingFraction": 0.75,
+                    "resetTime": "2026-10-10T12:00:00Z"},
+                {"bucketId": "gemini-flash-5h", "window": "5h", "remainingFraction": "90%"},
+                {"bucketId": "gemini-pro-weekly", "window": "weekly", "remainingFraction": 0.4,
+                    "resetTime": "2026-10-17T12:00:00Z"}
+            ]}));
+        }
+        json!({"groups": groups})
+    }
+
+    #[test]
+    fn remote_gemini_uses_antigravity_quota_summary_and_skips_non_gemini_pools() {
+        let mock = Mock::start(vec![
+            antigravity_credential("ag-1"),
+            envelope(antigravity_data(false)),
+            Reply::json(json!({"status_code": 403, "body": "TEST_SECRET"})),
+            envelope(json!(antigravity_data(true).to_string())),
+        ]);
+        let mut source = UsageSource::Cliproxy(Ok(Box::new(mock.session())));
+        let snapshot = fetch_snapshot(&[Provider::Gemini], &mut source);
+        let view = serde_json::to_value(snapshot_view(&snapshot)).unwrap();
+        let gemini = &view["providers"][0];
+        assert_eq!(gemini["provider"], "gemini");
+        assert_eq!(gemini["status"], "ok");
+        assert_eq!(gemini["source"], SOURCE);
+        assert_eq!(gemini["display"]["name"], "Gemini");
+        assert_eq!(gemini["windows"][0]["label"], "5h");
+        assert_eq!(gemini["windows"][0]["used_percent"], 25.0);
+        assert_eq!(gemini["windows"][0]["reset_at"], 1_791_633_600);
+        assert_eq!(gemini["windows"][1]["label"], "7d");
+        assert_eq!(gemini["windows"][1]["used_percent"], 60.0);
+        assert_eq!(gemini["display"]["capacity_used_percent"], 25);
+        assert!(!view.to_string().contains("TEST_SECRET"));
+        let requests = mock.finish();
+        assert_eq!(requests.len(), 4);
+        for (request, url) in requests[1..].iter().zip(GEMINI_QUOTA_URLS) {
+            assert_eq!(request.path, "/v8/management/requests/api-call");
+            assert_eq!(request.body["authIndex"], "ag-1");
+            assert_eq!(request.body["method"], "POST");
+            assert_eq!(request.body["url"], url);
+            assert_eq!(request.body["header"]["Authorization"], "Bearer $TOKEN$");
+            assert_eq!(request.body["data"], r#"{"project":"test-project-1"}"#);
+            assert!(!request.body.to_string().contains("TEST_MANAGEMENT_KEY"));
+        }
+    }
+
+    #[test]
+    fn gemini_without_project_or_gemini_buckets_is_unavailable() {
+        let mock = Mock::start(vec![Reply::json(json!({"files": [
+            {"type": "antigravity", "auth_index": "ag-1"}
+        ]}))]);
+        let mut source = UsageSource::Cliproxy(Ok(Box::new(mock.session())));
+        let snapshot = fetch_snapshot(&[Provider::Gemini], &mut source);
+        assert!(!snapshot.providers[0].available);
+        assert_eq!(mock.finish().len(), 1);
+
+        let mock = Mock::start(vec![
+            antigravity_credential("ag-1"),
+            envelope(antigravity_data(false)),
+            envelope(antigravity_data(false)),
+            envelope(antigravity_data(false)),
+        ]);
+        let mut source = UsageSource::Cliproxy(Ok(Box::new(mock.session())));
+        let snapshot = fetch_snapshot(&[Provider::Gemini], &mut source);
+        assert!(!snapshot.providers[0].available);
+        assert_eq!(
+            snapshot.providers[0].error.as_deref(),
+            Some("CLIProxyAPI Antigravity quota has no Gemini buckets")
+        );
+        assert_eq!(mock.finish().len(), 4);
+    }
+
+    #[test]
+    fn gemini_selection_requires_antigravity_and_honors_auth_index() {
+        let files = vec![
+            json!({"type": "gemini", "auth_index": "key"}),
+            json!({"type": "antigravity", "auth_index": "a", "project_id": "p"}),
+            json!({"type": "antigravity", "auth_index": "b", "project_id": "q"}),
+        ];
+        assert!(select_credential(&files, Provider::Gemini, None, "opencode-go").is_err());
+        let (file, index) =
+            select_credential(&files, Provider::Gemini, Some("b"), "opencode-go").unwrap();
+        assert_eq!(index, "b");
+        assert_eq!(project_id(file).as_deref(), Some("q"));
+        assert!(select_credential(&files, Provider::Gemini, Some("key"), "opencode-go").is_err());
+    }
+
     #[test]
     fn remote_go_snapshot_uses_server_key_placeholder_and_existing_json_contract() {
         for body in [go_data(), json!(go_data().to_string())] {
@@ -1392,6 +1576,7 @@ mod tests {
             None,
             None,
             Some("b".to_owned()),
+            None,
             Some("company-go".to_owned()),
             None,
         )
@@ -2009,6 +2194,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             Some("override-account".to_owned()),
         )
         .ok()
@@ -2045,7 +2231,7 @@ mod tests {
             "http://example.com/#TEST_SECRET",
             "http://example.com/management.html",
         ] {
-            let message = Session::new(url, "TEST_KEY", None, None, None, None, None)
+            let message = Session::new(url, "TEST_KEY", None, None, None, None, None, None)
                 .err()
                 .unwrap();
             assert!(!message.contains("TEST_SECRET"));
@@ -2058,16 +2244,29 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
                 None
             )
             .is_err()
         );
-        assert!(Session::new("http://localhost:8318", "", None, None, None, None, None).is_err());
+        assert!(
+            Session::new(
+                "http://localhost:8318",
+                "",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None
+            )
+            .is_err()
+        );
         for url in [
             "http://localhost:8318",
             "https://localhost:8318/v8/management",
         ] {
-            let session = Session::new(url, "TEST_KEY", None, None, None, None, None)
+            let session = Session::new(url, "TEST_KEY", None, None, None, None, None, None)
                 .ok()
                 .unwrap();
             assert_eq!(session.base.path(), "/v8/management/");

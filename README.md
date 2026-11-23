@@ -1,6 +1,6 @@
 # llm-usage
 
-Standalone terminal dashboard for subscription quota windows. Supports Codex, OpenCode Go, and Claude Code without importing Pi.
+Standalone terminal dashboard for subscription quota windows. Supports Codex, OpenCode Go, Claude Code, and Gemini (through CLIProxyAPI) without importing Pi.
 
 ```sh
 cargo run -- watch                 # refresh every 30 seconds
@@ -11,7 +11,7 @@ cargo run -- once --provider codex
 cargo run -- watch --interval 60 --no-color
 ```
 
-`watch` is the default command. Press `q` to exit. Use `--provider codex`, `--provider opencode-go`, or `--provider claude-code` repeatedly to filter providers.
+`watch` is the default command. Press `q` to exit. Use `--provider codex`, `--provider opencode-go`, `--provider claude-code`, or `--provider gemini` repeatedly to filter providers. Gemini is not in the default set; request it explicitly.
 
 ### Status bars and widgets
 
@@ -151,6 +151,28 @@ account ID, supply it explicitly:
 ```sh
 export LLM_USAGE_CLIPROXY_CODEX_ACCOUNT_ID='<ChatGPT account ID>'
 ```
+
+### Gemini through CLIProxyAPI
+
+Gemini quota is read from the proxy's **Antigravity** OAuth credential
+(`type: antigravity`); it is available only with `--source cliproxy`:
+
+```sh
+llm-usage json --source cliproxy --provider gemini
+```
+
+The client needs the credential's `project_id` (from credential metadata or
+attributes; `gemini_virtual_project` is also accepted). It never downloads the
+auth file. It submits `POST .../v1internal:retrieveUserQuotaSummary` with body
+`{"project": "<project_id>"}` through `POST /v8/management/requests/api-call`,
+with `Bearer $TOKEN$`; CLIProxyAPI substitutes and refreshes the token. Like the
+management UI, it tries the daily, daily-sandbox, and production Cloud Code
+hosts in order until one reports Gemini buckets.
+
+Only buckets whose id starts with `gemini-` count; Antigravity's Claude/GPT
+pools are ignored. Bucket windows `5h` and `weekly` become the `5h` and `7d`
+windows, each reporting its most-used bucket. Select one of several Antigravity
+accounts with `--gemini-auth-index` or `LLM_USAGE_CLIPROXY_GEMINI_AUTH_INDEX`.
 
 ### OpenCode Go through CLIProxyAPI
 
