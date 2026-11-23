@@ -46,9 +46,16 @@ const CLAUDE_CODE_CACHE_MAX_AGE: u64 = 60 * 60;
 const CLAUDE_CODE_REFRESH_INTERVAL: u64 = 5 * 60;
 const CLAUDE_CODE_RATE_LIMIT_COOLDOWN: u64 = 15 * 60;
 const OPENCODE_GO_USAGE_URL: &str = "https://opencode.ai/zen/go/v1/usage";
+/// Antigravity quota summary hosts, tried in order like `CLIProxyAPI`'s management UI:
+/// the daily hosts can return a partial summary without the Gemini pool.
+const GEMINI_QUOTA_URLS: [&str; 3] = [
+    "https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary",
+    "https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal:retrieveUserQuotaSummary",
+    "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary",
+];
 
 #[derive(Parser)]
-#[command(about = "Show subscription quotas for Codex, OpenCode Go, and Claude Code")]
+#[command(about = "Show subscription quotas for Codex, OpenCode Go, Claude Code, and Gemini")]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
@@ -138,6 +145,7 @@ enum Provider {
     Codex,
     OpencodeGo,
     ClaudeCode,
+    Gemini,
 }
 
 impl Provider {
@@ -146,6 +154,7 @@ impl Provider {
             Self::Codex => "codex",
             Self::OpencodeGo => "opencode-go",
             Self::ClaudeCode => "claude-code",
+            Self::Gemini => "gemini",
         }
     }
 
@@ -154,6 +163,7 @@ impl Provider {
             Self::Codex => "Codex",
             Self::OpencodeGo => "OpenCode Go",
             Self::ClaudeCode => "Claude Code",
+            Self::Gemini => "Gemini",
         }
     }
 }
@@ -592,6 +602,13 @@ fn fetch_snapshot(requested: &[Provider], source: &mut UsageSource) -> Snapshot 
                 Provider::Codex => fetch_codex(&client, fetched_at),
                 Provider::OpencodeGo => fetch_opencode_go(&client, fetched_at),
                 Provider::ClaudeCode => fetch_claude_code(&client, fetched_at),
+                // Gemini CLI quota needs a Code Assist project and OAuth token;
+                // only the proxy's server-held credential is supported.
+                Provider::Gemini => unavailable(
+                    Provider::Gemini,
+                    "Gemini quota requires --source cliproxy",
+                    fetched_at,
+                ),
             })
             .collect(),
     }
@@ -1368,6 +1385,86 @@ fn opencode_api_window(
     })
 }
 
+/// Gemini windows from an Antigravity `retrieveUserQuotaSummary` response.
+///
+/// Only buckets whose id starts with `gemini-` count; Antigravity's Claude/GPT
+/// pools are not Gemini quota. Each window reports its most-used bucket.
+fn gemini_windows(data: &Value) -> Vec<UsageWindow> {
+    let mut windows: Vec<UsageWindow> = Vec::new();
+    let buckets = data
+        .get("groups")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|group| group.get("buckets").and_then(Value::as_array))
+        .flatten();
+    for bucket in buckets {
+        let is_gemini = bucket
+            .get("bucketId")
+            .or_else(|| bucket.get("bucket_id"))
+            .and_then(Value::as_str)
+            .is_some_and(|id| id.trim().to_ascii_lowercase().starts_with("gemini-"));
+        let (label, seconds) = match bucket
+            .get("window")
+            .and_then(Value::as_str)
+            .map(|window| window.trim().to_ascii_lowercase())
+            .as_deref()
+        {
+            Some("5h" | "five-hour" | "five_hour") => ("5h", 18_000),
+            Some("weekly" | "week") => ("7d", 604_800),
+            _ => continue,
+        };
+        let Some(remaining) = bucket
+            .get("remainingFraction")
+            .or_else(|| bucket.get("remaining_fraction"))
+            .and_then(quota_fraction)
+        else {
+            continue;
+        };
+        if !is_gemini {
+            continue;
+        }
+        let used_percent = ((1.0 - remaining) * 100.0).clamp(0.0, 100.0);
+        let limit_reached = Some(remaining <= 0.0);
+        let reset_at = bucket
+            .get("resetTime")
+            .or_else(|| bucket.get("reset_time"))
+            .and_then(Value::as_str)
+            .and_then(|reset| DateTime::parse_from_rfc3339(reset.trim()).ok())
+            .and_then(|reset| u64::try_from(reset.timestamp()).ok());
+        let window = UsageWindow {
+            label,
+            status: window_status(used_percent, limit_reached),
+            used_percent: Some(used_percent),
+            reset_at,
+            window_seconds: Some(seconds),
+            limit_reached,
+        };
+        match windows.iter_mut().find(|existing| existing.label == label) {
+            Some(existing) if existing.used_percent < window.used_percent => *existing = window,
+            Some(_) => {}
+            None => windows.push(window),
+        }
+    }
+    windows.sort_by_key(|window| window.window_seconds);
+    windows
+}
+
+fn quota_fraction(value: &Value) -> Option<f64> {
+    let fraction = match value {
+        Value::Number(value) => value.as_f64()?,
+        Value::String(value) => {
+            let value = value.trim();
+            match value.strip_suffix('%') {
+                Some(percent) => percent.trim().parse::<f64>().ok()? / 100.0,
+                None => value.parse().ok()?,
+            }
+        }
+        _ => return None,
+    };
+    fraction.is_finite().then_some(fraction.clamp(0.0, 1.0))
+}
+
 fn window_status(used_percent: f64, limit_reached: Option<bool>) -> UsageStatus {
     if limit_reached == Some(true) || used_percent >= 100.0 {
         UsageStatus::RateLimited
@@ -1392,6 +1489,7 @@ fn provider_label(provider: &'static str) -> &'static str {
         "codex" => Provider::Codex.label(),
         "opencode-go" => Provider::OpencodeGo.label(),
         "claude-code" => Provider::ClaudeCode.label(),
+        "gemini" => Provider::Gemini.label(),
         other => other,
     }
 }
@@ -1401,6 +1499,7 @@ fn provider_summary_label(provider: &'static str) -> &'static str {
         "codex" => "Codex",
         "opencode-go" => "Go",
         "claude-code" => "Claude",
+        "gemini" => "Gemini",
         other => other,
     }
 }
